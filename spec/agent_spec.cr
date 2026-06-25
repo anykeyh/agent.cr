@@ -384,7 +384,7 @@ describe Agent do
       # Register the tool that should be auto-resolved
       tool_result = ""
       agent.register_tool("test_tool", "A test tool",
-        parameters: Agent::JSONSchema.from({
+        parameters: Agent::JSONConverter.from({
           type:       "object",
           properties: {
             input: {type: "string"},
@@ -478,7 +478,7 @@ describe Agent do
 
       # Register a tool that raises
       agent.register_tool("failing_tool", "A tool that always fails",
-        parameters: Agent::JSONSchema.from({
+        parameters: Agent::JSONConverter.from({
           type:       "object",
           properties: {} of String => String,
           required:   [] of String,
@@ -513,7 +513,7 @@ describe Agent do
 
       called = false
       agent.register_tool("echo", "Echo input",
-        parameters: Agent::JSONSchema.from({
+        parameters: Agent::JSONConverter.from({
           type:       "object",
           properties: {
             text: {type: "string"},
@@ -623,6 +623,161 @@ describe Agent do
       resp.error.as(Agent::ApiError).status_code.should eq(401)
     ensure
       server.close
+    end
+  end
+
+  describe "#trim_history!" do
+    it "trims history without orphaning tool messages" do
+      # A more complex mock server that:
+      #   1st ask -> returns tool calls
+      #   2nd ask -> returns plain text (tool results fed back)
+      #   3rd ask -> triggers trimming (more than max_history turns)
+      call_count = 0
+      server = HTTP::Server.new do |ctx|
+        if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+          call_count += 1
+          ctx.response.content_type = "text/event-stream"
+          ctx.response.status_code = 200
+
+          if call_count <= 2
+            # First two calls: return tool calls
+            delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "test_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+            delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"test"})}}]}, "index" => 0}]}.to_json
+            final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 5, "completion_tokens" => 5, "total_tokens" => 10}}.to_json
+            ctx.response.puts "data: #{delta1}"
+            ctx.response.flush
+            ctx.response.puts "data: #{delta2}"
+            ctx.response.flush
+            ctx.response.puts "data: #{final}"
+            ctx.response.puts "data: [DONE]"
+            ctx.response.flush
+          else
+            # Third call: return plain text (triggers trim after this)
+            reply = "final"
+            reply.each_char do |ch|
+              data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+              ctx.response.puts "data: #{data}"
+              ctx.response.flush
+            end
+            final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => reply.size, "total_tokens" => 10 + reply.size}}.to_json
+            ctx.response.puts "data: #{final}"
+            ctx.response.puts "data: [DONE]"
+            ctx.response.flush
+          end
+          ctx.response.close
+        else
+          ctx.response.status_code = 404
+        end
+      end
+
+      address = server.bind_tcp(0)
+      port = address.port
+      ready = Channel(Nil).new
+      spawn do
+        ready.send(nil)
+        server.listen
+      end
+      ready.receive
+
+      begin
+        config = Agent::Config.new(
+          api_key: "test-key",
+          api_endpoint: "http://localhost:#{port}",
+          max_history: 1, # keep only 1 user+assistant pair
+          auto_execute_tools: true,
+        )
+
+        agent = Agent.new(config)
+
+        # Register the tool so auto-resolve kicks in
+        agent.register_tool("test_tool", "A test tool",
+          parameters: Agent::JSONConverter.from({
+            type:       "object",
+            properties: {
+              input: {type: "string"},
+            },
+            required: ["input"],
+          })
+        ) do |args|
+          "processed: #{args["input"]?.try(&.as_s)}"
+        end
+
+        # Round 1: user->tool_call->tool_result->final
+        resp1 = agent.ask("First")
+        resp1.join
+        # History: user, assistant(tool_calls), tool, assistant(final) = 4
+
+        # Round 2: another tool-call turn
+        resp2 = agent.ask("Second")
+        resp2.join
+        # History grows: old 4 + new 4 = 8, then trimmed to max_history*2=2
+        # The trim must not orphan the tool messages from the surviving turn
+
+        # With max_history=1, only 2 user+assistant should survive
+        # The survivor must be a complete turn with no orphaned tool messages
+        agent.history.size.should eq(2)
+        agent.history[0].role.should eq(Agent::Role::User)
+        agent.history[0].content.should eq("Second")
+        agent.history[1].role.should eq(Agent::Role::Assistant)
+        agent.history[1].content.should eq("final")
+        agent.history[1].has_tool_calls?.should be_false
+      ensure
+        server.close
+      end
+    end
+  end
+
+  it "handles concurrent #ask from multiple fibers" do
+    with_mock_server do |port|
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+      responses = [] of Agent::Response
+      fibers = 5
+      channel = Channel(Nil).new(fibers)
+
+      fibers.times do |i|
+        spawn do
+          resp = agent.ask("Concurrent #{i}")
+          resp.join
+          responses << resp
+          channel.send(nil)
+        end
+      end
+
+      # Wait for all fibers to complete
+      fibers.times { channel.receive }
+
+      responses.size.should eq(fibers)
+      responses.each do |resp|
+        resp.message.content.should_not be_nil
+        resp.finished?.should be_true
+      end
+
+      # History should have 2*fibers entries (user + assistant per request)
+      agent.history.size.should eq(fibers * 2)
+    end
+  end
+
+  it "cancels an in-flight response" do
+    with_mock_server do |port|
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+      resp = agent.ask("Hello")
+
+      # Cancel immediately — the SSE stream should stop early
+      resp.cancel
+
+      # The response should still complete (finish_with_error or finish)
+      resp.join
+      resp.finished?.should be_true
     end
   end
 

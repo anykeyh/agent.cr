@@ -97,6 +97,33 @@ class Agent
       !tc.nil? && !tc.empty?
     end
 
+    def ==(other : self) : Bool
+      @role == other.role && @content == other.content &&
+        @tool_call_id == other.tool_call_id && @name == other.name &&
+        @tool_calls == other.tool_calls && @reasoning == other.reasoning
+    end
+
+    def ==(other) : Bool
+      false
+    end
+
+    def inspect(io : IO) : Nil
+      io << "#<Message:"
+      io << @role.to_s
+      if c = @content
+        io << " #{c[0, {c.size, 80}.min].inspect}"
+      elsif @content_parts
+        io << " (multimodal)"
+      end
+      if tc = @tool_calls
+        io << " tool_calls=#{tc.size}"
+      end
+      if @reasoning
+        io << " (reasoning)"
+      end
+      io << ">"
+    end
+
     # :nodoc:
     def to_request_body : Hash(String, JSON::Any)
       body = {"role" => JSON::Any.new(@role.to_s)}
@@ -132,9 +159,9 @@ class Agent
 
   # Token usage metadata from the API.
   class Usage
-    property prompt_tokens : Int32?
-    property completion_tokens : Int32?
-    property total_tokens : Int32?
+    getter prompt_tokens : Int32?
+    getter completion_tokens : Int32?
+    getter total_tokens : Int32?
 
     def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
     end

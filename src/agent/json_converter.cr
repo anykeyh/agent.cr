@@ -31,30 +31,20 @@ class Agent
 
     # :nodoc:
     def convert(value) : JSON::Any
-      if value.is_a?(JSON::Any)
-        value
-      elsif value.is_a?(Hash)
+      case value
+      when JSON::Any then value
+      when Hash, NamedTuple
         h = {} of String => JSON::Any
         value.each { |k, v| h[k.to_s] = convert(v) }
         JSON::Any.new(h)
-      elsif value.is_a?(NamedTuple)
-        h = {} of String => JSON::Any
-        value.each { |k, v| h[k.to_s] = convert(v) }
-        JSON::Any.new(h)
-      elsif value.is_a?(Array)
+      when Array
         JSON::Any.new(value.map { |v| convert(v) })
-      elsif value.is_a?(String)
-        JSON::Any.new(value)
-      elsif value.is_a?(Bool)
-        JSON::Any.new(value)
-      elsif value.is_a?(Int)
-        JSON::Any.new(value.to_i64)
-      elsif value.is_a?(Float64)
-        JSON::Any.new(value)
-      elsif value.is_a?(Float32)
-        JSON::Any.new(value.to_f64)
-      elsif value.nil?
-        JSON::Any.new(value)
+      when String  then JSON::Any.new(value)
+      when Bool    then JSON::Any.new(value)
+      when Int     then JSON::Any.new(value.to_i64)
+      when Float64 then JSON::Any.new(value)
+      when Float32 then JSON::Any.new(value.to_f64)
+      when Nil     then JSON::Any.new(value)
       else
         raise ArgumentError.new("JSONConverter cannot handle #{value.class}: #{value.inspect}")
       end

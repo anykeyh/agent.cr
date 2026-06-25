@@ -3,7 +3,7 @@ require "http/client"
 
 class Agent
   # Raised when trying to use an Agent that has been closed.
-  class ClosedError < Exception
+  class ClosedError < Error
     def initialize
       super("Agent has been closed")
     end
@@ -40,12 +40,15 @@ class Agent
     end
   end
 
-  # Internal request sent from #ask to the processing fiber.
-  # A nil messages array signals a reset request.
-  private record Request,
-    messages : Array(Message)?,
-    tools : Array(Tool)?,
-    response : Response
+  # Internal request types sent to the processing fiber.
+  private record AskRequest, messages : Array(Message), tools : Array(Tool)?, response : Response
+  private record ResetRequest, response : Response
+  private record RegisterToolRequest,
+    name : String,
+    tool : Tool,
+    callback : Hash(String, JSON::Any) -> String
+
+  private alias Request = AskRequest | ResetRequest | RegisterToolRequest
 
   getter config : Config
   getter history : Array(Message)
@@ -91,7 +94,15 @@ class Agent
     raise ArgumentError.new("Tool name must not be empty") if name.empty?
 
     tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
-    @registered_tools[name] = {tool: tool, callback: block}
+    entry = {tool: tool, callback: block}
+
+    if Fiber.current == @fiber
+      # Already inside the agent fiber — mutate directly to avoid deadlock.
+      @registered_tools[name] = entry
+    else
+      # From another fiber — route through the request channel for ordering.
+      @request_channel.send(RegisterToolRequest.new(name, tool, block))
+    end
   end
 
   # Close the agent, shutting down the background fiber.
@@ -130,7 +141,7 @@ class Agent
           end
 
     response = Response.new
-    @request_channel.send(Request.new(build_messages([msg]), tools, response))
+    @request_channel.send(AskRequest.new(build_messages([msg]), tools, response))
     @history << msg
     response
   rescue Channel::ClosedError
@@ -145,7 +156,7 @@ class Agent
     raise ClosedError.new if @closed
 
     response = Response.new
-    @request_channel.send(Request.new(build_messages(tool_results), tools, response))
+    @request_channel.send(AskRequest.new(build_messages(tool_results), tools, response))
     @history.concat(tool_results)
     response
   rescue Channel::ClosedError
@@ -159,7 +170,7 @@ class Agent
     raise ClosedError.new if @closed
 
     response = Response.new
-    @request_channel.send(Request.new(nil, nil, response))
+    @request_channel.send(ResetRequest.new(response))
     response.join
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -185,17 +196,20 @@ class Agent
     loop do
       request = @request_channel.receive
 
-      if request.messages.nil?
+      case request
+      in ResetRequest
         # Reset request — clear history and signal completion.
         @history.clear
         request.response.finish(
           Message.new(role: Role::Assistant, content: "History cleared."),
           Usage.new,
         )
-        next
+      in RegisterToolRequest
+        # Register a tool from another fiber.
+        @registered_tools[request.name] = {tool: request.tool, callback: request.callback}
+      in AskRequest
+        process_request_loop(request)
       end
-
-      process_request_loop(request)
     end
   rescue Channel::ClosedError
     # agent fiber exits on close — any fiber blocked in a send to the
@@ -206,10 +220,9 @@ class Agent
   # When the model returns tool calls and auto_execute_tools is enabled,
   # registered tools are executed inline and the result is sent back to the
   # model — all within this fiber, without returning to the caller.
-  private def process_request_loop(request : Request) : Nil
+  private def process_request_loop(request : AskRequest) : Nil
     response = request.response
-    # ameba:disable Lint/NotNil
-    messages = request.messages.not_nil!
+    messages = request.messages
     tools = request.tools
     max_iter = @config.max_tool_iterations
     iteration = 0
@@ -232,11 +245,14 @@ class Agent
         break
       end
 
-      # Append the assistant message to history before any decision.
+      # Append the assistant message to history. We need this here for the
+      # auto-resolve loop (tool results follow this message) and also for the
+      # manual-dispatch path (the caller calls #ask(tool_results) next, which
+      # requires the assistant(tool_calls) to precede the tool messages).
       @history << msg
 
       # If no tool calls, or auto_execute is disabled, or no registered tools — done.
-      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools || @registered_tools.empty?
+      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || @registered_tools.empty?
       if no_tools
         trim_history!
         response.finish(msg, usage, finish_reason: finish_reason)
@@ -248,6 +264,9 @@ class Agent
       results = execute_registered_tools(tool_calls)
 
       # If some tools had no registered handler, stop and let the caller handle it.
+      # NOTE: The assistant(tool_calls) is already in @history. The caller MUST
+      # follow up with #ask(tool_results) so the tool messages follow the
+      # assistant(tool_calls) — otherwise the next API request will be invalid.
       if results.empty?
         trim_history!
         response.finish(msg, usage, finish_reason: finish_reason)
@@ -262,16 +281,55 @@ class Agent
 
   # Trim history to respect max_history config, applied only after a
   # complete user—>assistant turn (not during intermediate tool-call steps).
+  #
+  # Trims in **turn units** so that tool messages are never orphaned:
+  # a "turn" is a user message followed by zero or more assistant + tool
+  # messages that belong to it. We drop complete turns from the front
+  # until the number of user+assistant messages is at most max*2.
   private def trim_history! : Nil
     if (max = @config.max_history) && max > 0
+      # Count only User and Assistant messages (tool messages are auxiliary).
       msg_count = @history.count { |m| m.role == Role::User || m.role == Role::Assistant }
-      if msg_count > max * 2
-        remove = @history.size - msg_count + max * 2
-        remove = {remove, @history.size}.min
-        remove = {remove, 0}.max
-        @history.shift(remove)
+      return unless msg_count > max * 2
+
+      # Walk forward to find how many messages to drop so that at most
+      # max*2 user+assistant messages remain. We track the index of the
+      # last message that would be dropped.
+      keep = max * 2
+      dropped = 0
+      @history.each_with_index do |m, i|
+        break if keep <= 0
+        if m.role == Role::User || m.role == Role::Assistant
+          keep -= 1
+        end
+        dropped = i + 1
       end
+
+      # Never split a tool-call group: if the cut point lands in the
+      # middle of an assistant(tool_calls)+tool-results sequence, advance
+      # to the next safe boundary.
+      if dropped < @history.size
+        dropped = find_turn_boundary(@history, dropped)
+      end
+
+      @history.shift(dropped) if dropped > 0
     end
+  end
+
+  # Find the earliest index >= start that is a valid turn boundary.
+  # A valid boundary is a User message (starts new turn), or one past
+  # an Assistant message without tool_calls (ends the previous turn).
+  private def find_turn_boundary(history : Array(Message), start : Int32) : Int32
+    idx = start
+    while idx < history.size
+      m = history[idx]
+      return idx if m.role == Role::User
+      if m.role == Role::Assistant && !m.has_tool_calls?
+        return idx + 1
+      end
+      idx += 1
+    end
+    history.size
   end
 
   # Execute registered tool callbacks for the given tool calls.
@@ -321,7 +379,7 @@ class Agent
   end
 
   # Returns the combined tool list: per-request tools merged with registered tools.
-  # Warns on name collisions (registered tools take precedence).
+  # Registered tools take precedence over per-request tools with the same name.
   private def combined_tools(tools : Array(Tool)?) : Array(Tool)?
     if @registered_tools.empty?
       tools
@@ -414,9 +472,12 @@ class Agent
                    end
                  end
 
+    content = full_content
+    content = nil if tool_calls && full_content.empty?
+
     Message.new(
       role: Role::Assistant,
-      content: tool_calls && full_content.empty? ? nil : full_content,
+      content: content,
       tool_calls: tool_calls,
       reasoning: reasoning_content.empty? ? nil : reasoning_content,
     )
@@ -433,10 +494,15 @@ class Agent
     finish_reason = nil
 
     body_io.each_line do |line|
+      # Check for cancellation — non-blocking try_receive.
+      if response.cancelled?
+        break
+      end
+
       line = line.strip
       next if line.empty?
       next if line == "data: [DONE]"
-      next unless line.starts_with?("data")
+      next unless line.starts_with?("data:")
 
       # Extract JSON after "data:" (possibly with or without trailing space, per SSE spec)
       json_data = line[5..]
@@ -458,24 +524,25 @@ class Agent
 
   private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
     if usage_data = parsed["usage"]?
-      u = usage_data.as_h
-      Usage.new(
-        prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
-        completion_tokens: u["completion_tokens"]?.try(&.as_i),
-        total_tokens: u["total_tokens"]?.try(&.as_i)
-      )
+      if u = usage_data.as_h?
+        return Usage.new(
+          prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
+          completion_tokens: u["completion_tokens"]?.try(&.as_i),
+          total_tokens: u["total_tokens"]?.try(&.as_i)
+        )
+      end
     elsif timings = parsed["timings"]?
-      timings_h = timings.as_h
-      prompt_n = timings_h["prompt_n"]?.try(&.as_i)
-      predicted_n = timings_h["predicted_n"]?.try(&.as_i)
-      Usage.new(
-        prompt_tokens: prev_usage.prompt_tokens || prompt_n,
-        completion_tokens: prev_usage.completion_tokens || predicted_n,
-        total_tokens: prev_usage.total_tokens || (prompt_n && predicted_n ? prompt_n + predicted_n : nil)
-      )
-    else
-      prev_usage
+      if timings_h = timings.as_h?
+        prompt_n = timings_h["prompt_n"]?.try(&.as_i)
+        predicted_n = timings_h["predicted_n"]?.try(&.as_i)
+        return Usage.new(
+          prompt_tokens: prev_usage.prompt_tokens || prompt_n,
+          completion_tokens: prev_usage.completion_tokens || predicted_n,
+          total_tokens: prev_usage.total_tokens || (prompt_n && predicted_n ? prompt_n + predicted_n : nil)
+        )
+      end
     end
+    prev_usage
   end
 
   private def process_deltas(
@@ -530,8 +597,11 @@ class Agent
         fn_h = fn.as_h
         if fn_h_name = fn_h["name"]?
           name_str = fn_h_name.as_s
+          # Only push the name chunk once — subsequent deltas may re-send the name.
+          if entry.name.empty?
+            response.push_chunk(Response::Chunk.new(name_str, Response::ChunkKind::ToolCallName))
+          end
           entry.name = name_str
-          response.push_chunk(Response::Chunk.new(name_str, Response::ChunkKind::ToolCallName))
         end
         if fn_h_args = fn_h["arguments"]?
           entry.arguments += fn_h_args.as_s
@@ -545,7 +615,7 @@ class Agent
     body = {
       "model"    => JSON::Any.new(@config.model),
       "messages" => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
-      "stream"   => JSON::Any.new(@config.stream),
+      "stream"   => JSON::Any.new(true),
     }
 
     if mt = @config.max_tokens

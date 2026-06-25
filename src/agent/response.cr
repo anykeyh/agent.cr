@@ -46,10 +46,13 @@ class Agent
     private getter message_channel : Channel(Message)
     # Signals the final Usage metadata.
     private getter usage_channel : Channel(Usage)
+    # Signals cancellation to the processing fiber.
+    private getter cancel_channel : Channel(Nil)
 
     @message : Message?
     @metadata : Usage?
     @done = false
+    @cancelled = false
     @finish_reason : String?
     @error : Agent::Error?
 
@@ -57,6 +60,24 @@ class Agent
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
       @message_channel = Channel(Message).new(1)
       @usage_channel = Channel(Usage).new(1)
+      @cancel_channel = Channel(Nil).new(1)
+    end
+
+    # Request cancellation of this in-flight response.
+    # The HTTP fiber will abort after the current SSE line is processed.
+    # Safe to call from any fiber. Idempotent.
+    def cancel : Nil
+      return if @cancelled
+
+      @cancelled = true
+      @cancel_channel.send(nil)
+    rescue Channel::ClosedError
+      # already finished
+    end
+
+    # Returns true if cancel was requested.
+    def cancelled? : Bool
+      @cancelled
     end
 
     # Returns true when the response has finished assembling.
