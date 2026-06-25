@@ -1,0 +1,17 @@
+name: agent-cr
+version: 0.1.0
+
+description: |
+  A Crystal shard for building agentic loops with OpenAI-compatible APIs.
+
+authors:
+  - Your Name <you@example.com>
+
+crystal: ">= 1.10"
+
+license: MIT
+
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    version: ~> 1.6
