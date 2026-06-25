@@ -32,7 +32,8 @@ class Agent
   end
 
   # Accumulates a tool call across multiple SSE deltas.
-  private struct ToolCallDelta
+  # Must be a class (reference type) so the hash entry is mutated in place.
+  private class ToolCallDelta
     property id : String
     property name : String
     property arguments : String
@@ -56,11 +57,40 @@ class Agent
   @request_channel : Channel(Request)
   @fiber : Fiber
   @closed = false
+  @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String))
 
   def initialize(@config : Config)
     @history = [] of Message
     @request_channel = Channel(Request).new
+    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
     @fiber = spawn { run_loop }
+  end
+
+  # Register a tool with a callback that will be called automatically when the
+  # model requests this tool (when `auto_execute_tools` is true in config).
+  #
+  # The callback receives the parsed JSON arguments and returns a string result.
+  # The tool definition is automatically included in all subsequent #ask calls.
+  #
+  # ```
+  # agent.register_tool("get_weather", "Get the weather for a city",
+  #   parameters: {
+  #     "type"       => JSON::Any.new("object"),
+  #     "properties" => JSON::Any.new({
+  #       "city" => JSON::Any.new({"type" => JSON::Any.new("string")}),
+  #     }),
+  #     "required"   => JSON::Any.new([] of JSON::Any),
+  #   }
+  # ) do |args|
+  #   city = args["city"]?.try(&.as_s) || "unknown"
+  #   "The weather in #{city} is sunny."
+  # end
+  # ```
+  def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, &block : Hash(String, JSON::Any) -> String) : Nil
+    raise ClosedError.new if @closed
+
+    tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
+    @registered_tools[name] = {tool: tool, callback: block}
   end
 
   # Close the agent, shutting down the background fiber.
@@ -75,6 +105,10 @@ class Agent
 
   # Send a user message and return a Response immediately.
   # The actual HTTP call happens in a background fiber.
+  #
+  # If `auto_execute_tools` is true (default) and the model requests registered
+  # tools, the agent will automatically execute them and re-ask the model in
+  # the background. The final Response (after all tool loops) is returned.
   #
   # ```
   # resp = agent.ask("What is the capital of France?")
@@ -93,9 +127,24 @@ class Agent
             Message.new(role: "user", content: content)
           end
 
-    @history << msg
     response = Response.new
-    @request_channel.send(Request.new(build_messages, tools, response))
+    @request_channel.send(Request.new(build_messages([msg]), tools, response))
+    @history << msg
+    response
+  rescue Channel::ClosedError
+    raise ClosedError.new
+  end
+
+  # Send tool result messages and return a Response immediately.
+  # Used to feed tool call results back to the model after it requests them.
+  #
+  # Raises Agent::ClosedError if the agent has been closed via #close.
+  def ask(tool_results : Array(Message), tools : Array(Tool)? = nil) : Response
+    raise ClosedError.new if @closed
+
+    response = Response.new
+    @request_channel.send(Request.new(build_messages(tool_results), tools, response))
+    @history.concat(tool_results)
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -112,7 +161,7 @@ class Agent
   # Internal
   # ---------------------------------------------------------------------------
 
-  private def build_messages : Array(Message)
+  private def build_messages(msgs_to_append : Array(Message)) : Array(Message)
     msgs = [] of Message
 
     if (sys = @config.system_prompt) && !sys.empty?
@@ -120,36 +169,112 @@ class Agent
     end
 
     msgs.concat(@history)
+    msgs.concat(msgs_to_append)
     msgs
   end
 
   private def run_loop : Nil
     loop do
       request = @request_channel.receive
-      begin
-        process_request(request)
-      rescue ex
-        request.response.finish(
-          Message.new(role: "assistant", content: "Agent error: #{ex.message}"),
-          Usage.new
-        )
-      end
+      process_request_loop(request)
     end
   rescue Channel::ClosedError
     # agent fiber exits on close — any fiber blocked in a send to the
     # request channel will also see ClosedError and raise to its caller.
   end
 
-  private def process_request(req : Request) : Nil
-    http_post_stream(req.messages, req.tools, req.response)
+  # Process a request with automatic tool resolution.
+  # When the model returns tool calls and auto_execute_tools is enabled,
+  # registered tools are executed inline and the result is sent back to the
+  # model — all within this fiber, without returning to the caller.
+  private def process_request_loop(request : Request) : Nil
+    response = request.response
+    messages = request.messages
+    tools = request.tools
+
+    loop do
+      msg, usage, finish_reason = http_post_stream(messages, tools, response)
+
+      # On error, http_post_stream already called response.finish — stop.
+      if msg.content.try(&.starts_with?("Agent error:"))
+        break
+      end
+
+      # If no tool calls, or auto_execute is disabled, or no registered tools — done.
+      unless msg.has_tool_calls? && @config.auto_execute_tools && !@registered_tools.empty?
+        response.finish(msg, usage, finish_reason: finish_reason)
+        break
+      end
+
+      tool_calls = msg.tool_calls.not_nil!
+      results = execute_registered_tools(tool_calls)
+
+      # If some tools had no registered handler, stop and let the caller handle it.
+      if results.empty?
+        response.finish(msg, usage, finish_reason: finish_reason)
+        break
+      end
+
+      # Append tool results to history and prepare the next iteration.
+      @history.concat(results)
+      messages = build_messages(results)
+    end
+  end
+
+  # Execute registered tool callbacks for the given tool calls.
+  # Returns an array of tool result Messages, or an empty array if any
+  # tool call has no registered handler.
+  private def execute_registered_tools(tool_calls : Array(ToolCall)) : Array(Message)
+    results = [] of Message
+
+    tool_calls.each do |tc|
+      entry = @registered_tools[tc.name]?
+      if entry.nil?
+        return [] of Message
+      end
+
+      # Parse the JSON arguments string into a hash for the callback.
+      args_hash = begin
+        parsed = JSON.parse(tc.arguments)
+        parsed.as_h? || {} of String => JSON::Any
+      rescue JSON::ParseException
+        {} of String => JSON::Any
+      end
+
+      result = entry[:callback].call(args_hash)
+
+      results << Message.new(
+        role: "tool",
+        content: result,
+        tool_call_id: tc.id,
+        name: tc.name,
+      )
+    end
+
+    results
+  end
+
+  # Returns the combined tool list: per-request tools merged with registered tools.
+  private def combined_tools(tools : Array(Tool)?) : Array(Tool)?
+    if @registered_tools.empty?
+      tools
+    else
+      reg = @registered_tools.values.map(&.[:tool])
+      if tools
+        tools + reg
+      else
+        reg
+      end
+    end
   end
 
   private def http_post_stream(
     messages : Array(Message),
     tools : Array(Tool)?,
     response : Response,
-  ) : Nil
-    body = build_request_body(messages, tools)
+  ) : {Message, Usage, String?}
+    all_tools = combined_tools(tools)
+    body = build_request_body(messages, all_tools)
     client = build_http_client
     full_path = api_chat_path
 
@@ -159,7 +284,7 @@ class Agent
           raise "#{http_resp.status_code} #{http_resp.status_message}"
         end
 
-        content_buffer, reasoning_buffer, tool_call_deltas, usage =
+        content_buffer, reasoning_buffer, tool_call_deltas, usage, finish_reason =
           process_sse_stream(http_resp.body_io, response)
 
         final_message = build_final_message(content_buffer, reasoning_buffer, tool_call_deltas)
@@ -174,11 +299,12 @@ class Agent
           end
         end
 
-        response.finish(final_message, usage)
+        {final_message, usage, finish_reason}
       end
     rescue ex
       error_msg = Message.new(role: "assistant", content: "Agent error: #{ex.message}")
-      response.finish(error_msg, Usage.new)
+      response.finish(error_msg, Usage.new, finish_reason: nil)
+      {error_msg, Usage.new, nil}
     ensure
       client.close
     end
@@ -239,11 +365,12 @@ class Agent
   private def process_sse_stream(
     body_io : IO,
     response : Response,
-  ) : {String::Builder, String::Builder, Hash(Int32, ToolCallDelta), Usage}
+  ) : {String::Builder, String::Builder, Hash(Int32, ToolCallDelta), Usage, String?}
     tool_call_deltas = {} of Int32 => ToolCallDelta
     content_buffer = String::Builder.new
     reasoning_buffer = String::Builder.new
     usage = Usage.new
+    finish_reason = nil
 
     body_io.each_line do |line|
       line = line.strip
@@ -261,10 +388,10 @@ class Agent
       parsed = json.as_h? || next
 
       usage = parse_usage(parsed, usage)
-      process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_call_deltas)
+      finish_reason = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_call_deltas) || finish_reason
     end
 
-    {content_buffer, reasoning_buffer, tool_call_deltas, usage}
+    {content_buffer, reasoning_buffer, tool_call_deltas, usage, finish_reason}
   end
 
   private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
@@ -295,10 +422,16 @@ class Agent
     content_buffer : String::Builder,
     reasoning_buffer : String::Builder,
     tool_call_deltas : Hash(Int32, ToolCallDelta),
-  ) : Nil
+  ) : String?
+    finish_reason = nil
+
     choices = parsed["choices"]?.try(&.as_a?) || [] of JSON::Any
     choices.each do |choice|
       delta = choice["delta"]?.try(&.as_h?) || next
+
+      if reason = choice["finish_reason"]?.try(&.as_s?)
+        finish_reason = reason
+      end
 
       if c = delta["content"]?.try(&.as_s?)
         content_buffer << c
@@ -310,13 +443,16 @@ class Agent
         response.push_chunk(Response::Chunk.new(rc, Response::ChunkKind::Reasoning))
       end
 
-      process_tool_call_deltas(delta, tool_call_deltas)
+      process_tool_call_deltas(delta, tool_call_deltas, response)
     end
+
+    finish_reason
   end
 
   private def process_tool_call_deltas(
     delta : Hash(String, JSON::Any),
     tool_call_deltas : Hash(Int32, ToolCallDelta),
+    response : Response,
   ) : Nil
     tc_delta = delta["tool_calls"]?.try(&.as_a?) || return
     tc_delta.each do |tcd|
@@ -335,6 +471,7 @@ class Agent
         end
         if fn_h_args = fn_h["arguments"]?
           entry.arguments += fn_h_args.as_s
+          response.push_chunk(Response::Chunk.new(fn_h_args.as_s, Response::ChunkKind::ToolCall))
         end
       end
     end

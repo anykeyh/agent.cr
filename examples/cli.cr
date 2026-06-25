@@ -1,13 +1,13 @@
 require "colorize"
 require "../src/agent"
 
-# Example: Minimal interactive CLI chat with streaming output.
+# Example: Minimal interactive CLI chat with streaming output and registered tools.
 #
 # Usage:
 #   crystal run examples/cli.cr
 #   crystal run examples/cli.cr -- --endpoint http://localhost:8080/v1 --model llama3
 #
-# Multi-line input: press Enter on an empty line to send the message.
+# Multi-line input: press Ctrl+D on an empty line to send the message.
 #   /reset       — clear conversation history
 #   /exit, /quit — quit
 #
@@ -41,7 +41,21 @@ config = Agent::Config.new(
 
 agent = Agent.new(config)
 
-puts "── agent-cr interactive chat ──"
+# Register tools with callbacks — the agent will auto-resolve tool calls inline.
+# No manual tool-call while-loop needed!
+# `Agent::JSONSchema.from` converts a Crystal NamedTuple/Hash to JSON::Any
+# automatically — no JSON::Any.new(...) boilerplate.
+agent.register_tool("get_time", "Get the current date and time in ISO 8601 format (e.g. 2026-06-25T10:30:00Z). Returns the local time.",
+  parameters: Agent::JSONSchema.from({
+    type:       "object",
+    properties: {} of String => String,
+    required:   [] of String,
+  })
+) do |_args|
+  "The current local time is: #{Time.local.to_s("%Y-%m-%dT%H:%M:%S%z")}"
+end
+
+puts "── agent-cr interactive chat (with registered tools) ──"
 puts "  endpoint: #{config.api_endpoint}"
 puts "  model:    #{config.model}"
 puts "  (Ctrl+D to send, /reset to clear history, /exit to quit)"
@@ -79,6 +93,10 @@ loop do
   end
 
   begin
+    # The agent automatically includes registered tools in every call.
+    # When the model requests a tool, the agent executes it and re-asks
+    # the model — all transparently. The Response you get back is the
+    # final one (after all tool resolutions).
     response = agent.ask(input)
     STDOUT.sync = true
 

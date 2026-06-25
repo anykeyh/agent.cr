@@ -64,19 +64,23 @@ Each `Agent.new(config)` spawns a persistent fiber:
 ```
 
 `run_loop` blocks on `@request_channel.receive`. When a `Request` arrives it
-calls `process_request` → `http_post_stream`. After the HTTP call completes,
-the fiber loops back and waits for the next request. This serialises requests
-through one fiber — no locking needed.
+calls `http_post_stream` directly, processes the SSE stream, and appends the
+assistant reply to `@history`. After the HTTP call completes, the fiber loops
+back and waits for the next request. This serialises requests through one
+fiber — no locking needed.
 
 ### Request / Response decoupling
 
 `#ask` does three things synchronously:
-1. Builds a `Message` and appends it to `@history`
-2. Creates a fresh `Response` object (with its own set of channels)
-3. Sends a `Request` (messages + tools + response) on the channel
+1. Builds a `Message`
+2. Creates a fresh `Response` object and sends a `Request` (messages + tools + response)
+3. Appends the message to `@history` only after the channel send succeeds
 
 It returns the `Response` immediately. The calling fiber is free to read
 chunks, wait for the message, or do other work.
+
+Appending to `@history` after the send ensures that if `close()` races with
+`#ask()`, an orphan message is never left in history.
 
 ### Buffered chunk channel
 
@@ -150,9 +154,6 @@ they're formatted as:
 }
 ```
 
-`from_delta` is a convenience for building a `Message` from a single SSE
-delta — useful when implementing non-streaming fallback or re-parsing.
-
 ### Reasoning content
 
 Reasoning (e.g. `reasoning_content` from DeepSeek/Qwen models) is **not**
@@ -177,12 +178,12 @@ Crystal's `JSON::Any` doesn't auto-coerce Hash literals. Every value in a
 
 `build_request_body` and `Message#to_request_body` handle this with `.map { |h| JSON::Any.new(h) }` on intermediate arrays.
 
-### NamedTuple immutability
+### ToolCallDelta struct
 
-The tool-call accumulator was initially a `NamedTuple` — but Crystal's
-NamedTuples are immutable, so `entry[:id] += ...` fails. The fix was to use
-`Array(String)` with positional access: `entry[0]` for id, `entry[1]` for
-name, `entry[2]` for arguments.
+Tool-call deltas across SSE chunks are accumulated in a `ToolCallDelta`
+private struct (`@id`, `@name`, `@arguments`), keyed by the delta's `index`
+field. This replaces an earlier positional-`Array(String)` approach and is
+much clearer.
 
 ### Fiber scheduling
 
@@ -194,7 +195,10 @@ transfers control to the agent fiber. No explicit `Fiber.yield` is needed.
 ### Channel close ordering
 
 `finish` sends to `message_channel` and `usage_channel` *before* closing
-`chunk_channel`. This ordering matters:
+`chunk_channel`, and also captures the `finish_reason` from the API
+("stop", "length", "tool_calls", etc.) exposed as `Response#finish_reason`.
+
+This ordering matters:
 - The consumer (blocked on `#message` or `#metadata`) can unblock before
   the chunk channel is closed.
 - The `ensure` block guarantees the chunk channel is always closed, even
@@ -210,7 +214,6 @@ tests can run in parallel.
 The mock server must call `ctx.response.close` after writing SSE data,
 otherwise the HTTP client will block waiting for more data (the `each_line`
 reader waits until EOF/connection close).
-### Mock server in tests
 
 ### Error handling
 
@@ -218,8 +221,9 @@ All errors produced by the agent use a consistent prefix `"Agent error: ..."`
 so callers can pattern-match programmatically.
 
 If `http_post_stream` raises (network error, non-200 status, JSON parse
-failure), `process_request` catches it and calls `response.finish` with an
-error message. This ensures `#message` and `#join` always unblock.
+failure), the error is caught in `http_post_stream`'s own rescue block, which
+calls `response.finish` with an error message. This ensures `#message` and
+`#join` always unblock.
 
 ## Development workflow
 
@@ -309,12 +313,83 @@ bin/ameba && crystal tool format --check
 2. Update `CHANGELOG.md` if one exists (otherwise, consider adding one).
 3. Tag the release with `git tag v<version>` and push.
 
-## Future considerations
+## Registered tools & auto-resolve loop
 
-- **Agentic loop** — The shard currently handles one request per `#ask`.
-  The `run_loop` fiber is ready for a tool-use loop: after processing a
-  response with tool calls, the agent could execute the tools, append the
-  results, and re-ask without returning to the caller.
+Tools can be registered with a callback via `register_tool(name, description, parameters, &block)`.
+The callback receives the parsed JSON arguments hash and returns a string result.
+
+### How it works
+
+When `Config#auto_execute_tools` is `true` (the default):
+
+1. All registered tools are automatically merged into every `#ask` request.
+2. The `run_loop` fiber calls `process_request_loop` instead of the old single-pass.
+3. After each HTTP response, if the model returned tool calls and all are
+   registered, the agent executes the callbacks, appends tool-result messages
+   to history, and sends a new request to the model — all within the fiber.
+4. The loop continues until the model returns a message without tool calls.
+5. `Response#finish` is called only on the final (resolved) message.
+
+```mermaid
+flowchart TD
+    A[#ask] --> B[Send Request to fiber]
+    B --> C[http_post_stream]
+    C --> D{Tool calls?}
+    D -->|No| E[response.finish]
+    D -->|Yes| F{auto_execute?}
+    F -->|No| E
+    F -->|Yes| G{All registered?}
+    G -->|No| E
+    G -->|Yes| H[Execute callbacks]
+    H --> I[Append results to history]
+    I --> C
+```
+
+### Error handling in the loop
+
+- If any tool call has no registered handler, the loop breaks and returns
+  the tool-call message to the caller — same as manual dispatch.
+- If `http_post_stream` raises, the error message is returned and the loop
+  exits (no retry).
+
+## To answer your questions directly
+
+### Tool call ordering
+
+**Tool calls always arrive as a single assistant message** with
+`finish_reason: "tool_calls"`. The model does NOT interleave content and
+ tool calls within a single turn. All tool calls in a response are emitted
+ together at the end of the stream. The SSE deltas may arrive in arbitrary
+ order (id in one chunk, name in another, arguments in pieces), but the
+ final assembled message has all tool calls at once.
+
+### Callback registration vs manual dispatch
+
+You are right that the old pattern — building `Agent::Tool` schema objects
+manually, checking `message.has_tool_calls?`, parsing arguments,
+constructing `Message` objects with `role: "tool"`, and while-looping —
+is cumbersome. The new `register_tool` API eliminates all of that:
+
+```crystal
+# OLD: ~25 lines of boilerplate (see examples/cli.cr before the change)
+GET_TIME_TOOL = Agent::Tool.new(...)
+resp = agent.ask(input, tools: [GET_TIME_TOOL])
+resp.stream { |chunk| print chunk }
+msg = resp.message
+while msg.has_tool_calls?
+  results = execute_tool_calls(msg.tool_calls.not_nil!)
+  resp = agent.ask(results, tools: [GET_TIME_TOOL])
+  resp.stream { |chunk| print chunk }
+  msg = resp.message
+end
+
+# NEW: 5 lines, no while-loop
+agent.register_tool("get_time", ...) { |args| ... }
+resp = agent.ask(input)
+resp.stream { |chunk| print chunk }
+```
+
+## Future considerations
 
 - **Request cancellation** — A cancel channel could be added to `Response`
   so that `#ask` can abort an in-flight request.

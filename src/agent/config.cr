@@ -9,6 +9,7 @@ class Agent
     getter read_timeout : Time::Span?
     getter connect_timeout : Time::Span?
     getter max_history : Int32?
+    getter auto_execute_tools : Bool
 
     def initialize(
       @api_key : String? = nil,
@@ -20,6 +21,7 @@ class Agent
       @read_timeout : Time::Span? = nil,
       @connect_timeout : Time::Span? = nil,
       @max_history : Int32? = nil,
+      @auto_execute_tools : Bool = true,
     )
     end
   end

@@ -80,7 +80,7 @@ def with_mock_server(&)
 end
 
 describe Agent do
-  it "asks a question and gets a streamed response" do
+  it "asks a question and gets a streamed response", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -102,7 +102,7 @@ describe Agent do
     end
   end
 
-  it "tags reasoning chunks correctly" do
+  it "tags reasoning chunks correctly", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -127,7 +127,7 @@ describe Agent do
     end
   end
 
-  it "maintains conversation history" do
+  it "maintains conversation history", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -150,7 +150,7 @@ describe Agent do
     end
   end
 
-  it "resets history" do
+  it "resets history", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -169,7 +169,7 @@ describe Agent do
     end
   end
 
-  it "supports multimodal input" do
+  it "supports multimodal input", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -194,7 +194,7 @@ describe Agent do
     end
   end
 
-  it "supports tool calls in the request" do
+  it "supports tool calls in the request", tags: "remote" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -235,8 +235,88 @@ describe Agent do
     content.to_s.should contain("error")
   end
 
+  it "reports finish_reason from the API response" do
+    with_mock_server do |port|
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+      resp = agent.ask("Hello")
+      resp.join
+      resp.finish_reason.should eq("stop")
+    end
+  end
+
+  it "streams tool call argument chunks" do
+    # Build JSON for tool call streaming test
+    # arguments value must have its inner quotes escaped for valid JSON
+    args_json = %({"city":"Paris"})
+    delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_abc", "type" => "function", "function" => {"name" => "get_weather", "arguments" => ""}}]}, "index" => 0}]}.to_json
+    delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => args_json}}]}, "index" => 0}]}.to_json
+    delta3 = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 5, "completion_tokens" => 10, "total_tokens" => 15}}.to_json
+
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        ctx.response.puts "data: #{delta1}"
+        ctx.response.flush
+
+        ctx.response.puts "data: #{delta2}"
+        ctx.response.flush
+
+        ctx.response.puts "data: #{delta3}"
+        ctx.response.puts "data: [DONE]"
+        ctx.response.flush
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+      resp = agent.ask("What's the weather?")
+
+      tool_chunks = [] of String
+      resp.stream do |chunk|
+        if chunk.kind == Agent::Response::ChunkKind::ToolCall
+          tool_chunks << chunk.text
+        end
+      end
+
+      tool_chunks.join.should eq(%({"city":"Paris"}))
+      resp.message.tool_calls.should_not be_nil
+      resp.message.tool_calls.not_nil!.size.should eq(1)
+      resp.message.tool_calls.not_nil![0].name.should eq("get_weather")
+      resp.message.tool_calls.not_nil![0].id.should eq("call_abc")
+      resp.message.tool_calls.not_nil![0].arguments.should eq(%({"city":"Paris"}))
+      resp.finish_reason.should eq("tool_calls")
+    ensure
+      server.close
+    end
+  end
+
   describe "#close" do
-    it "prevents further #ask calls" do
+    it "prevents further #ask calls", tags: "remote" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",
@@ -254,7 +334,7 @@ describe Agent do
       end
     end
 
-    it "prevents #reset" do
+    it "prevents #reset", tags: "remote" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",
@@ -269,13 +349,13 @@ describe Agent do
       end
     end
 
-    it "is safe to call multiple times" do
+    it "is safe to call multiple times", tags: "remote" do
       agent = Agent.new(Agent::Config.new)
       agent.close
       agent.close # should not raise
     end
 
-    it "finishes an in-flight request normally before closing" do
+    it "finishes an in-flight request normally before closing", tags: "remote" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",

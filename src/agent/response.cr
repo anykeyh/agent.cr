@@ -9,6 +9,7 @@ class Agent
     enum ChunkKind
       Content
       Reasoning
+      ToolCall
     end
 
     # A streamed text chunk tagged with its origin.
@@ -31,15 +32,16 @@ class Agent
     # --- channels used internally by the agent ---
 
     # The fiber pushes streamed Chunks here.
-    getter chunk_channel : Channel(Chunk)
+    private getter chunk_channel : Channel(Chunk)
     # Signals the final Message once fully built.
-    getter message_channel : Channel(Message)
+    private getter message_channel : Channel(Message)
     # Signals the final Usage metadata.
-    getter usage_channel : Channel(Usage)
+    private getter usage_channel : Channel(Usage)
 
     @message : Message?
     @metadata : Usage?
     @done = false
+    @finish_reason : String?
 
     def initialize
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
@@ -50,6 +52,12 @@ class Agent
     # Returns true when the response has finished assembling.
     def finished? : Bool
       @done
+    end
+
+    # The reason the stream finished ("stop", "length", "tool_calls", etc.)
+    # or nil if not known / the request errored.
+    def finish_reason : String?
+      @finish_reason
     end
 
     # Return the fully assembled message (blocks until ready).
@@ -90,10 +98,11 @@ class Agent
 
     # Internal: signal that the response is complete.
     # Safe to call multiple times — subsequent calls are no-ops.
-    def finish(message : Message, usage : Usage) : Nil
+    def finish(message : Message, usage : Usage, finish_reason : String? = nil) : Nil
       return if @done
 
       @done = true
+      @finish_reason = finish_reason
       @message_channel.send(message)
       @usage_channel.send(usage)
     ensure
