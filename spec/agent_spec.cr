@@ -80,7 +80,7 @@ def with_mock_server(&)
 end
 
 describe Agent do
-  it "asks a question and gets a streamed response", tags: "remote" do
+  it "asks a question and gets a streamed response" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -102,7 +102,7 @@ describe Agent do
     end
   end
 
-  it "tags reasoning chunks correctly", tags: "remote" do
+  it "tags reasoning chunks correctly" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -127,7 +127,7 @@ describe Agent do
     end
   end
 
-  it "maintains conversation history", tags: "remote" do
+  it "maintains conversation history" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -143,14 +143,14 @@ describe Agent do
 
       # History should contain both user messages and their responses
       agent.history.size.should eq(4)
-      agent.history[0].role.should eq("user")
+      agent.history[0].role.should eq(Agent::Role::User)
       agent.history[0].content.should eq("First")
-      agent.history[2].role.should eq("user")
+      agent.history[2].role.should eq(Agent::Role::User)
       agent.history[2].content.should eq("Second")
     end
   end
 
-  it "resets history", tags: "remote" do
+  it "resets history" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -169,7 +169,7 @@ describe Agent do
     end
   end
 
-  it "supports multimodal input", tags: "remote" do
+  it "supports multimodal input" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -194,7 +194,7 @@ describe Agent do
     end
   end
 
-  it "supports tool calls in the request", tags: "remote" do
+  it "supports tool calls in the request" do
     with_mock_server do |port|
       config = Agent::Config.new(
         api_key: "test-key",
@@ -233,6 +233,8 @@ describe Agent do
     content = resp.message.content
     content.should_not be_nil
     content.to_s.should contain("error")
+    resp.error?.should be_true
+    resp.error.should be_a(Agent::ConnectionError)
   end
 
   it "reports finish_reason from the API response" do
@@ -304,19 +306,328 @@ describe Agent do
       end
 
       tool_chunks.join.should eq(%({"city":"Paris"}))
-      resp.message.tool_calls.should_not be_nil
-      resp.message.tool_calls.not_nil!.size.should eq(1)
-      resp.message.tool_calls.not_nil![0].name.should eq("get_weather")
-      resp.message.tool_calls.not_nil![0].id.should eq("call_abc")
-      resp.message.tool_calls.not_nil![0].arguments.should eq(%({"city":"Paris"}))
+      tcs = resp.message.tool_calls
+      tcs.should_not be_nil
+      # ameba:disable Lint/NotNil
+      tcs = tcs.not_nil!
+      tcs.size.should eq(1)
+      tcs[0].name.should eq("get_weather")
+      tcs[0].id.should eq("call_abc")
+      tcs[0].arguments.should eq(%({"city":"Paris"}))
       resp.finish_reason.should eq("tool_calls")
     ensure
       server.close
     end
   end
 
+  it "auto-resolves registered tools" do
+    # A mock server that:
+    #  1st request -> returns a tool call (finish_reason: tool_calls)
+    #  2nd request -> returns a normal text response (finish_reason: stop)
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          # Return tool call
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "test_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"world"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          # Return normal text (tool result was included in the second request)
+          reply = "Tool result received: processed"
+          reply.each_char do |ch|
+            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+            ctx.response.puts "data: #{data}"
+            ctx.response.flush
+          end
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      # Register the tool that should be auto-resolved
+      tool_result = ""
+      agent.register_tool("test_tool", "A test tool",
+        parameters: Agent::JSONSchema.from({
+          type:       "object",
+          properties: {
+            input: {type: "string"},
+          },
+          required: ["input"],
+        })
+      ) do |args|
+        tool_result = args["input"]?.try(&.as_s) || ""
+        "Processed: #{tool_result}"
+      end
+
+      resp = agent.ask("Run the tool")
+
+      # Stream the response (should be the final text after tool resolution)
+      content = [] of String
+      resp.stream { |chunk| content << chunk.text if chunk.content? }
+
+      # Verify the auto-resolve loop ran
+      resp.message.content.should eq("Tool result received: processed")
+      tool_result.should eq("world")
+
+      # Verify the history includes: user, assistant(tool_calls), tool, assistant(final)
+      agent.history.size.should eq(4)
+      agent.history[0].role.should eq(Agent::Role::User)
+      agent.history[1].role.should eq(Agent::Role::Assistant)
+      agent.history[1].has_tool_calls?.should be_true
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[3].role.should eq(Agent::Role::Assistant)
+      agent.history[3].content.should eq("Tool result received: processed")
+    ensure
+      server.close
+    end
+  end
+
+  it "reports error when auto-resolve tool callback raises" do
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "failing_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          # Second request: verify the tool error message is present in history
+          reply = "error noted"
+          reply.each_char do |ch|
+            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+            ctx.response.puts "data: #{data}"
+            ctx.response.flush
+          end
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      # Register a tool that raises
+      agent.register_tool("failing_tool", "A tool that always fails",
+        parameters: Agent::JSONSchema.from({
+          type:       "object",
+          properties: {} of String => String,
+          required:   [] of String,
+        })
+      ) do |_args|
+        raise "Intentional failure"
+      end
+
+      resp = agent.ask("Test failing tool")
+      resp.join
+
+      # The tool error should be captured as a tool result message with error text
+      tool_msg = agent.history[2]
+      tool_msg.role.should eq(Agent::Role::Tool)
+      tool_msg.content.should_not be_nil
+      tool_msg.content.to_s.should contain("Error executing tool 'failing_tool'")
+      tool_msg.content.to_s.should contain("Intentional failure")
+    ensure
+      server.close
+    end
+  end
+
+  it "handles register_tool with no auto_execute" do
+    with_mock_server do |port|
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: false,
+      )
+
+      agent = Agent.new(config)
+
+      called = false
+      agent.register_tool("echo", "Echo input",
+        parameters: Agent::JSONSchema.from({
+          type:       "object",
+          properties: {
+            text: {type: "string"},
+          },
+          required: ["text"],
+        })
+      ) do |args|
+        called = true
+        args["text"]?.try(&.as_s) || ""
+      end
+
+      # When auto_execute_tools is false, the tool should be included in the request
+      # but the callback won't be called automatically.
+      resp = agent.ask("Hello")
+      resp.join
+      called.should be_false
+    end
+  end
+
+  it "trims history with max_history" do
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        reply = "Response #{call_count}"
+        reply.each_char do |ch|
+          data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+          ctx.response.puts "data: #{data}"
+          ctx.response.flush
+        end
+        final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => reply.size, "total_tokens" => 10 + reply.size}}.to_json
+        ctx.response.puts "data: #{final}"
+        ctx.response.puts "data: [DONE]"
+        ctx.response.flush
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        max_history: 1, # Keep at most 1 user+assistant pair
+      )
+
+      agent = Agent.new(config)
+      agent.ask("First").join  # history: user, assistant (2 msgs)
+      agent.ask("Second").join # history: user, assistant, user, assistant (4 msgs) -> trimmed to 2
+      agent.ask("Third").join  # trimmed again
+
+      # With max_history=1, only the last user+assistant pair should survive
+      agent.history.size.should eq(2)
+      agent.history[0].role.should eq(Agent::Role::User)
+      agent.history[0].content.should eq("Third")
+      agent.history[1].role.should eq(Agent::Role::Assistant)
+      agent.history[1].content.should eq("Response 3")
+    ensure
+      server.close
+    end
+  end
+
+  it "produces structured error on API non-2xx" do
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.response.status_code = 401
+        ctx.response.puts "Unauthorized"
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "bad-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+      resp = agent.ask("Hello")
+      resp.join
+      resp.error?.should be_true
+      resp.error.should be_a(Agent::ApiError)
+      resp.error.as(Agent::ApiError).status_code.should eq(401)
+    ensure
+      server.close
+    end
+  end
+
   describe "#close" do
-    it "prevents further #ask calls", tags: "remote" do
+    it "prevents further #ask calls" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",
@@ -334,7 +645,7 @@ describe Agent do
       end
     end
 
-    it "prevents #reset", tags: "remote" do
+    it "prevents #reset" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",
@@ -349,13 +660,13 @@ describe Agent do
       end
     end
 
-    it "is safe to call multiple times", tags: "remote" do
+    it "is safe to call multiple times" do
       agent = Agent.new(Agent::Config.new)
       agent.close
       agent.close # should not raise
     end
 
-    it "finishes an in-flight request normally before closing", tags: "remote" do
+    it "finishes an in-flight request normally before closing" do
       with_mock_server do |port|
         config = Agent::Config.new(
           api_key: "test-key",

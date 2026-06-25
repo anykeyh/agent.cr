@@ -1,6 +1,7 @@
 require "./agent/version"
 require "./agent/config"
-require "./agent/json_schema"
+require "./agent/error"
+require "./agent/json_converter"
 require "./agent/message"
 require "./agent/response"
 require "./agent/agent"

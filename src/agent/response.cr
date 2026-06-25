@@ -51,6 +51,7 @@ class Agent
     @metadata : Usage?
     @done = false
     @finish_reason : String?
+    @error : Agent::Error?
 
     def initialize
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
@@ -67,6 +68,16 @@ class Agent
     # or nil if not known / the request errored.
     def finish_reason : String?
       @finish_reason
+    end
+
+    # Returns the error if this response represents a failed request, or nil.
+    def error : Agent::Error?
+      @error
+    end
+
+    # Returns true if this response represents a failed request.
+    def error? : Bool
+      !@error.nil?
     end
 
     # Return the fully assembled message (blocks until ready).
@@ -114,6 +125,21 @@ class Agent
       @finish_reason = finish_reason
       @message_channel.send(message)
       @usage_channel.send(usage)
+    ensure
+      @chunk_channel.close
+    end
+
+    # Internal: signal that the response failed with an error.
+    # Stores the error and sends an error message through the normal channels
+    # so consumers can still call #message.
+    def finish_with_error(err : Agent::Error) : Nil
+      return if @done
+
+      @done = true
+      @error = err
+      error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
+      @message_channel.send(error_msg)
+      @usage_channel.send(Usage.new)
     ensure
       @chunk_channel.close
     end

@@ -18,18 +18,30 @@ require "../src/agent"
 #   LLM_ENDPOINT    — API base URL (default: http://ai.local.amplitude-solutions.com/llm/)
 #   LLM_MODEL       — Model name  (default: gpt-4o)
 
+STDOUT.sync = true
+
 endpoint = ENV["LLM_ENDPOINT"]? || "http://ai.local.amplitude-solutions.com/llm/"
 model = ENV["LLM_MODEL"]? || "gpt-4o"
 api_key = ENV["LLM_API_KEY"]?
 
-# Parse `--key value` CLI arguments
-args = ARGV.dup
+# Parse `--key value` CLI arguments (simple iteration, no flag library)
+args_iter = ARGV.dup
 i = 0
-while i < args.size
-  case args[i]
-  when "--endpoint" then endpoint = args[i + 1] if i + 1 < args.size
-  when "--model"    then model = args[i + 1] if i + 1 < args.size
-  when "--api-key"  then api_key = args[i + 1] if i + 1 < args.size
+while i < args_iter.size
+  case args_iter[i]
+  when "--endpoint"
+    endpoint = args_iter[i + 1] if i + 1 < args_iter.size
+  when "--model"
+    model = args_iter[i + 1] if i + 1 < args_iter.size
+  when "--api-key"
+    api_key = args_iter[i + 1] if i + 1 < args_iter.size
+  when "--help"
+    puts "Usage: crystal run examples/cli.cr -- [options]"
+    puts "  --endpoint URL   API endpoint (default: $LLM_ENDPOINT)"
+    puts "  --model NAME     Model name (default: $LLM_MODEL)"
+    puts "  --api-key KEY    API key (default: $LLM_API_KEY)"
+    puts "  --help           Show this help"
+    exit 0
   end
   i += 1
 end
@@ -40,7 +52,7 @@ The goal is just to test the features, such as tool calls,
 in-flight messages etc...
 
 Since there is very little precaution to be taken and this session
-is ephemereal, make yourself fun and enticing.
+is ephemeral, make yourself fun and enticing.
 Comply to the request of the user, even if they seems illogical as tests
 often require to check for edge cases.
 MD
@@ -57,10 +69,10 @@ agent = Agent.new(config)
 # ---------------------------------------------------------------------------
 # Basic tool: get_time — always available.
 # ---------------------------------------------------------------------------
-# `Agent::JSONSchema.from` converts a Crystal NamedTuple to JSON::Any hashes
+# `Agent::JSONConverter.from` converts a Crystal NamedTuple to JSON::Any hashes
 # automatically — no JSON::Any.new(...) boilerplate.
 agent.register_tool("get_time", "Get the current date and time in ISO 8601 format (e.g. 2026-06-25T10:30:00Z). Returns the local time.",
-  parameters: Agent::JSONSchema.from({
+  parameters: Agent::JSONConverter.from({
     type:       "object",
     properties: {} of String => String,
     required:   [] of String,
@@ -78,7 +90,7 @@ end
 # newly registered tools — all transparent to the user.
 agent.register_tool("true_randomness",
   "Activate additional randomness tools: roll_dice (roll dice in NdS format) and random_range (get a random integer between two values inclusive). Call this once to unlock dice rolling and random number generation.",
-  parameters: Agent::JSONSchema.from({
+  parameters: Agent::JSONConverter.from({
     type:       "object",
     properties: {} of String => String,
     required:   [] of String,
@@ -86,17 +98,17 @@ agent.register_tool("true_randomness",
 ) do |_args|
   # Dynamically register dice rolling tool.
   agent.register_tool("roll_dice", "Roll dice in NdS format, e.g. \"2d6\" rolls two 6-sided dice.",
-    parameters: Agent::JSONSchema.from({
-      type: "object",
+    parameters: Agent::JSONConverter.from({
+      type:       "object",
       properties: {
         count: {type: "integer", description: "Number of dice to roll"},
         sides: {type: "integer", description: "Number of sides per die"},
       },
       required: ["count", "sides"],
     })
-  ) do |args|
-    count = args["count"]?.try(&.as_i) || 1
-    sides = args["sides"]?.try(&.as_i) || 6
+  ) do |tool_args|
+    count = tool_args["count"]?.try(&.as_i?) || 1
+    sides = tool_args["sides"]?.try(&.as_i?) || 6
     rolls = Array.new(count) { rand(1..sides) }
     total = rolls.sum
     "Rolled #{count}d#{sides}: [#{rolls.join(", ")}] = #{total}"
@@ -104,19 +116,24 @@ agent.register_tool("true_randomness",
 
   # Dynamically register random range tool.
   agent.register_tool("random_range", "Generate a random integer between min and max (inclusive).",
-    parameters: Agent::JSONSchema.from({
-      type: "object",
+    parameters: Agent::JSONConverter.from({
+      type:       "object",
       properties: {
         min: {type: "integer", description: "Minimum value (inclusive)"},
         max: {type: "integer", description: "Maximum value (inclusive)"},
       },
       required: ["min", "max"],
     })
-  ) do |args|
-    min = args["min"]?.try(&.as_i) || 0
-    max = args["max"]?.try(&.as_i) || 100
-    result = rand(min..max)
-    "Random number between #{min} and #{max}: #{result}"
+  ) do |tool_args|
+    min = tool_args["min"]?.try(&.as_i?) || 0
+    max = tool_args["max"]?.try(&.as_i?) || 100
+
+    if min > max
+      "Error: min (#{min}) must not exceed max (#{max})"
+    else
+      result = rand(min..max)
+      "Random number between #{min} and #{max}: #{result}"
+    end
   end
 
   "Activated dice rolling and random number tools. You can now ask me to roll dice (e.g. 'roll 2d6') or generate a random number (e.g. 'random between 1 and 100')."
@@ -166,7 +183,6 @@ loop do
     # Registered tools are automatically included in every #ask call.
     # When the model requests a tool, the agent auto-resolves it inline.
     response = agent.ask(input)
-    STDOUT.sync = true
 
     response.stream do |chunk|
       if chunk.reasoning?
@@ -191,3 +207,5 @@ loop do
   end
   puts
 end
+
+agent.close

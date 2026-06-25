@@ -2,7 +2,7 @@ require "./spec_helper"
 
 describe Agent::Message do
   it "builds a simple text message body" do
-    msg = Agent::Message.new(role: "user", content: "Hello")
+    msg = Agent::Message.new(role: Agent::Role::User, content: "Hello")
     body = msg.to_request_body
     body["role"].as_s.should eq("user")
     body["content"].as_s.should eq("Hello")
@@ -13,7 +13,7 @@ describe Agent::Message do
       Agent::ContentPart.new(text: "What is this?"),
       Agent::ContentPart.new(image_url: "https://example.com/img.jpg"),
     ]
-    msg = Agent::Message.new(role: "user", content_parts: parts)
+    msg = Agent::Message.new(role: Agent::Role::User, content_parts: parts)
     body = msg.to_request_body
     content = body["content"].as_a
     content[0].as_h["type"].as_s.should eq("text")
@@ -22,17 +22,17 @@ describe Agent::Message do
 
   it "builds a message with tool calls" do
     tool_calls = [Agent::ToolCall.new(id: "call_1", name: "get_weather", arguments: %({"city":"Paris"}))]
-    msg = Agent::Message.new(role: "assistant", tool_calls: tool_calls)
+    msg = Agent::Message.new(role: Agent::Role::Assistant, tool_calls: tool_calls)
     body = msg.to_request_body
     body["tool_calls"].as_a.size.should eq(1)
   end
 
   it "detects tool calls via has_tool_calls?" do
-    msg = Agent::Message.new(role: "assistant", content: "Hello")
+    msg = Agent::Message.new(role: Agent::Role::Assistant, content: "Hello")
     msg.has_tool_calls?.should be_false
 
     tcs = [Agent::ToolCall.new(id: "c1", name: "fn", arguments: "{}")]
-    msg2 = Agent::Message.new(role: "assistant", tool_calls: tcs)
+    msg2 = Agent::Message.new(role: Agent::Role::Assistant, tool_calls: tcs)
     msg2.has_tool_calls?.should be_true
   end
 end
@@ -53,9 +53,11 @@ describe Agent::ContentPart do
 end
 
 describe Agent::ToolCall do
-  it "serializes via JSON" do
+  it "stores tool call data" do
     tc = Agent::ToolCall.new(id: "tc_1", name: "fn", arguments: "{}")
-    tc.to_json.should contain("tc_1")
+    tc.id.should eq("tc_1")
+    tc.name.should eq("fn")
+    tc.arguments.should eq("{}")
   end
 end
 

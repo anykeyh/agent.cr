@@ -1,6 +1,5 @@
 require "json"
 require "http/client"
-require "uri"
 
 class Agent
   # Raised when trying to use an Agent that has been closed.
@@ -12,16 +11,12 @@ class Agent
 
   # A tool definition that matches the OpenAI tools API.
   class Tool
-    include JSON::Serializable
-
     getter function : FunctionDef
 
     def initialize(@function : FunctionDef)
     end
 
     class FunctionDef
-      include JSON::Serializable
-
       getter name : String
       getter description : String?
       getter parameters : Hash(String, JSON::Any)?
@@ -46,8 +41,9 @@ class Agent
   end
 
   # Internal request sent from #ask to the processing fiber.
+  # A nil messages array signals a reset request.
   private record Request,
-    messages : Array(Message),
+    messages : Array(Message)?,
     tools : Array(Tool)?,
     response : Response
 
@@ -59,10 +55,14 @@ class Agent
   @closed = false
   @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String))
 
+  # Persistent HTTP client for connection pooling.
+  @http_client : HTTP::Client
+
   def initialize(@config : Config)
     @history = [] of Message
     @request_channel = Channel(Request).new
     @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
+    @http_client = build_http_client
     @fiber = spawn { run_loop }
   end
 
@@ -79,7 +79,7 @@ class Agent
   #     "properties" => JSON::Any.new({
   #       "city" => JSON::Any.new({"type" => JSON::Any.new("string")}),
   #     }),
-  #     "required"   => JSON::Any.new([] of JSON::Any),
+  #     "required" => JSON::Any.new([] of JSON::Any),
   #   }
   # ) do |args|
   #   city = args["city"]?.try(&.as_s) || "unknown"
@@ -88,6 +88,7 @@ class Agent
   # ```
   def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, &block : Hash(String, JSON::Any) -> String) : Nil
     raise ClosedError.new if @closed
+    raise ArgumentError.new("Tool name must not be empty") if name.empty?
 
     tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
     @registered_tools[name] = {tool: tool, callback: block}
@@ -101,6 +102,7 @@ class Agent
 
     @closed = true
     @request_channel.close
+    @http_client.close
   end
 
   # Send a user message and return a Response immediately.
@@ -122,9 +124,9 @@ class Agent
 
     msg = if imgs = images
             parts = [ContentPart.new(text: content)] + imgs.map { |url| ContentPart.new(image_url: url) }
-            Message.new(role: "user", content_parts: parts)
+            Message.new(role: Role::User, content_parts: parts)
           else
-            Message.new(role: "user", content: content)
+            Message.new(role: Role::User, content: content)
           end
 
     response = Response.new
@@ -151,10 +153,16 @@ class Agent
   end
 
   # Reset the conversation history back to the system prompt only.
+  # Waits for any in-flight request to complete before clearing history.
   # Raises Agent::ClosedError if the agent has been closed.
   def reset : Nil
     raise ClosedError.new if @closed
-    @history.clear
+
+    response = Response.new
+    @request_channel.send(Request.new(nil, nil, response))
+    response.join
+  rescue Channel::ClosedError
+    raise ClosedError.new
   end
 
   # ---------------------------------------------------------------------------
@@ -165,7 +173,7 @@ class Agent
     msgs = [] of Message
 
     if (sys = @config.system_prompt) && !sys.empty?
-      msgs << Message.new(role: "system", content: sys)
+      msgs << Message.new(role: Role::System, content: sys)
     end
 
     msgs.concat(@history)
@@ -176,6 +184,17 @@ class Agent
   private def run_loop : Nil
     loop do
       request = @request_channel.receive
+
+      if request.messages.nil?
+        # Reset request — clear history and signal completion.
+        @history.clear
+        request.response.finish(
+          Message.new(role: Role::Assistant, content: "History cleared."),
+          Usage.new,
+        )
+        next
+      end
+
       process_request_loop(request)
     end
   rescue Channel::ClosedError
@@ -189,23 +208,26 @@ class Agent
   # model — all within this fiber, without returning to the caller.
   private def process_request_loop(request : Request) : Nil
     response = request.response
-    messages = request.messages
+    # ameba:disable Lint/NotNil
+    messages = request.messages.not_nil!
     tools = request.tools
 
     loop do
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
-      # On error, http_post_stream already called response.finish — stop.
-      if msg.content.try(&.starts_with?("Agent error:"))
+      # On error, http_post_stream already called response.finish/finish_with_error — stop.
+      if response.error?
         break
       end
 
       # If no tool calls, or auto_execute is disabled, or no registered tools — done.
-      unless msg.has_tool_calls? && @config.auto_execute_tools && !@registered_tools.empty?
+      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools || @registered_tools.empty?
+      if no_tools
         response.finish(msg, usage, finish_reason: finish_reason)
         break
       end
 
+      # ameba:disable Lint/NotNil
       tool_calls = msg.tool_calls.not_nil!
       results = execute_registered_tools(tool_calls)
 
@@ -215,15 +237,19 @@ class Agent
         break
       end
 
-      # Append tool results to history and prepare the next iteration.
+      # Append tool results to history, then prepare next iteration.
+      # We build messages from an empty append array because @history already
+      # contains everything (including the results we just appended).
       @history.concat(results)
-      messages = build_messages(results)
+      messages = build_messages([] of Message)
     end
   end
 
   # Execute registered tool callbacks for the given tool calls.
   # Returns an array of tool result Messages, or an empty array if any
   # tool call has no registered handler.
+  # If a callback raises, the error is caught and returned as a tool-result
+  # message with an error description, so the agent fiber never dies.
   private def execute_registered_tools(tool_calls : Array(ToolCall)) : Array(Message)
     results = [] of Message
 
@@ -238,13 +264,24 @@ class Agent
         parsed = JSON.parse(tc.arguments)
         parsed.as_h? || {} of String => JSON::Any
       rescue JSON::ParseException
-        {} of String => JSON::Any
+        # Let the model know its arguments were malformed.
+        results << Message.new(
+          role: Role::Tool,
+          content: "Error parsing arguments for tool '#{tc.name}': invalid JSON",
+          tool_call_id: tc.id,
+          name: tc.name,
+        )
+        next
       end
 
-      result = entry[:callback].call(args_hash)
+      result = begin
+        entry[:callback].call(args_hash)
+      rescue ex
+        "Error executing tool '#{tc.name}': #{ex.message}"
+      end
 
       results << Message.new(
-        role: "tool",
+        role: Role::Tool,
         content: result,
         tool_call_id: tc.id,
         name: tc.name,
@@ -255,13 +292,17 @@ class Agent
   end
 
   # Returns the combined tool list: per-request tools merged with registered tools.
+  # Warns on name collisions (registered tools take precedence).
   private def combined_tools(tools : Array(Tool)?) : Array(Tool)?
     if @registered_tools.empty?
       tools
     else
       reg = @registered_tools.values.map(&.[:tool])
+
       if tools
-        tools + reg
+        # Filter out per-request tools whose name collides with registered tools
+        filtered = tools.reject { |t| @registered_tools.has_key?(t.function.name) }
+        filtered + reg
       else
         reg
       end
@@ -275,13 +316,13 @@ class Agent
   ) : {Message, Usage, String?}
     all_tools = combined_tools(tools)
     body = build_request_body(messages, all_tools)
-    client = build_http_client
-    full_path = api_chat_path
+    full_path = @config.chat_path
+    client = @http_client
 
     begin
       client.post(full_path, headers: HTTP::Headers.new, body: body.to_json) do |http_resp|
         unless http_resp.status.ok?
-          raise "#{http_resp.status_code} #{http_resp.status_message}"
+          raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
         end
 
         content_buffer, reasoning_buffer, tool_call_deltas, usage, finish_reason =
@@ -291,27 +332,32 @@ class Agent
 
         @history << final_message
 
-        # Trim history to max_history pairs (2 messages per turn: user + assistant)
+        # Trim history: estimate one turn as 2 messages per user/assistant pair,
+        # but also count tool messages which may appear between user and assistant.
         if (max = @config.max_history) && max > 0
-          if @history.size > max * 2
-            remove = @history.size - max * 2
+          msg_count = @history.count { |m| m.role == Role::User || m.role == Role::Assistant }
+          if msg_count > max * 2
+            remove = @history.size - msg_count + max * 2
+            remove = {remove, @history.size}.min
+            remove = {remove, 0}.max
             @history.shift(remove)
           end
         end
 
         {final_message, usage, finish_reason}
       end
+    rescue ex : ApiError
+      response.finish_with_error(ex)
+      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message}"), Usage.new, nil}
     rescue ex
-      error_msg = Message.new(role: "assistant", content: "Agent error: #{ex.message}")
-      response.finish(error_msg, Usage.new, finish_reason: nil)
-      {error_msg, Usage.new, nil}
-    ensure
-      client.close
+      err = ConnectionError.new(ex.message || "Unknown error", cause: ex)
+      response.finish_with_error(err)
+      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message}"), Usage.new, nil}
     end
   end
 
   private def build_http_client : HTTP::Client
-    uri = URI.parse(@config.api_endpoint)
+    uri = @config.parsed_uri
     client = HTTP::Client.new(uri)
 
     if (rt = @config.read_timeout) && rt > Time::Span.zero
@@ -327,15 +373,14 @@ class Agent
       end
       req.headers["Content-Type"] = "application/json"
       req.headers["Accept"] = "text/event-stream"
+
+      # Inject extra headers
+      if extra = @config.extra_headers
+        extra.each { |k, v| req.headers[k] = v }
+      end
     end
 
     client
-  end
-
-  private def api_chat_path : String
-    uri = URI.parse(@config.api_endpoint)
-    base_path = uri.path.empty? || uri.path == "/" ? "" : uri.path.gsub(/\/+$/, "")
-    "#{base_path}/chat/completions"
   end
 
   private def build_final_message(
@@ -355,7 +400,7 @@ class Agent
                  end
 
     Message.new(
-      role: "assistant",
+      role: Role::Assistant,
       content: tool_calls && full_content.empty? ? nil : full_content,
       tool_calls: tool_calls,
       reasoning: reasoning_content.empty? ? nil : reasoning_content,
@@ -376,9 +421,11 @@ class Agent
       line = line.strip
       next if line.empty?
       next if line == "data: [DONE]"
-      next unless line.starts_with?("data: ")
+      next unless line.starts_with?("data")
 
-      json_data = line[6..]
+      # Extract JSON after "data:" (possibly with or without trailing space, per SSE spec)
+      json_data = line[5..]
+      json_data = json_data.lstrip(' ')
 
       json = begin
         JSON.parse(json_data)
@@ -461,14 +508,15 @@ class Agent
       entry = tool_call_deltas[idx] ||= ToolCallDelta.new
 
       if id = tcd["id"]?
-        entry.id += id.as_s
+        entry.id = id.as_s
       end
 
       if fn = tcd["function"]?
         fn_h = fn.as_h
         if fn_h_name = fn_h["name"]?
-          entry.name += fn_h_name.as_s
-          response.push_chunk(Response::Chunk.new(fn_h_name.as_s, Response::ChunkKind::ToolCallName))
+          name_str = fn_h_name.as_s
+          entry.name = name_str
+          response.push_chunk(Response::Chunk.new(name_str, Response::ChunkKind::ToolCallName))
         end
         if fn_h_args = fn_h["arguments"]?
           entry.arguments += fn_h_args.as_s
@@ -482,7 +530,7 @@ class Agent
     body = {
       "model"    => JSON::Any.new(@config.model),
       "messages" => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
-      "stream"   => JSON::Any.new(true),
+      "stream"   => JSON::Any.new(@config.stream),
     }
 
     if mt = @config.max_tokens

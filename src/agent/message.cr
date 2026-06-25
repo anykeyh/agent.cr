@@ -1,6 +1,35 @@
 require "json"
 
 class Agent
+  # Valid roles for messages as per the OpenAI API.
+  enum Role
+    System
+    User
+    Assistant
+    Tool
+
+    # Serialise to JSON as lowercase string.
+    def to_s : String
+      case self
+      in System    then "system"
+      in User      then "user"
+      in Assistant then "assistant"
+      in Tool      then "tool"
+      end
+    end
+
+    # Parse from a lowercase string. Raises ArgumentError for invalid input.
+    def self.parse(value : String) : Role
+      case value.downcase
+      when "system"    then System
+      when "user"      then User
+      when "assistant" then Assistant
+      when "tool"      then Tool
+      else                  raise ArgumentError.new("Unknown role: '#{value}'")
+      end
+    end
+  end
+
   # A content part used in multimodal messages (text + images).
   class ContentPart
     getter text : String?
@@ -8,6 +37,9 @@ class Agent
     getter image_detail : String?
 
     def initialize(@text : String? = nil, @image_url : String? = nil, @image_detail : String = "auto")
+      if @text.nil? && @image_url.nil?
+        raise ArgumentError.new("ContentPart must have either text or image_url")
+      end
     end
 
     # :nodoc:
@@ -31,11 +63,9 @@ class Agent
 
   # Represents a tool call from the assistant.
   class ToolCall
-    include JSON::Serializable
-
-    property id : String
-    property name : String
-    property arguments : String # JSON string
+    getter id : String
+    getter name : String
+    getter arguments : String # JSON string
 
     def initialize(@id : String, @name : String, @arguments : String)
     end
@@ -43,7 +73,7 @@ class Agent
 
   # A message in the conversation.
   class Message
-    getter role : String
+    getter role : Role
     getter content : String?
     getter content_parts : Array(ContentPart)?
     getter tool_calls : Array(ToolCall)?
@@ -52,7 +82,7 @@ class Agent
     getter reasoning : String?
 
     def initialize(
-      @role : String,
+      @role : Role,
       @content : String? = nil,
       @content_parts : Array(ContentPart)? = nil,
       @tool_calls : Array(ToolCall)? = nil,
@@ -69,7 +99,7 @@ class Agent
 
     # :nodoc:
     def to_request_body : Hash(String, JSON::Any)
-      body = {"role" => JSON::Any.new(@role)}
+      body = {"role" => JSON::Any.new(@role.to_s)}
 
       # Build content
       if parts = @content_parts
@@ -102,8 +132,6 @@ class Agent
 
   # Token usage metadata from the API.
   class Usage
-    include JSON::Serializable
-
     property prompt_tokens : Int32?
     property completion_tokens : Int32?
     property total_tokens : Int32?

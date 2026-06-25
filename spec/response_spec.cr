@@ -16,7 +16,7 @@ describe Agent::Response do
     spawn do
       resp.push_chunk(Agent::Response::Chunk.new("Hello ", Agent::Response::ChunkKind::Content))
       resp.push_chunk(Agent::Response::Chunk.new("world", Agent::Response::ChunkKind::Content))
-      resp.finish(Agent::Message.new(role: "assistant", content: "Hello world"), Agent::Usage.new)
+      resp.finish(Agent::Message.new(role: Agent::Role::Assistant, content: "Hello world"), Agent::Usage.new)
     end
 
     resp.stream { |chunk| chunks << chunk.text }
@@ -25,7 +25,7 @@ describe Agent::Response do
 
   it "returns the final message" do
     resp = Agent::Response.new
-    msg = Agent::Message.new(role: "assistant", content: "Paris")
+    msg = Agent::Message.new(role: Agent::Role::Assistant, content: "Paris")
 
     spawn do
       resp.finish(msg, Agent::Usage.new)
@@ -39,7 +39,7 @@ describe Agent::Response do
     usage = Agent::Usage.new(prompt_tokens: 10, completion_tokens: 20, total_tokens: 30)
 
     spawn do
-      resp.finish(Agent::Message.new(role: "assistant", content: ""), usage)
+      resp.finish(Agent::Message.new(role: Agent::Role::Assistant, content: ""), usage)
     end
 
     meta = resp.metadata
@@ -56,7 +56,7 @@ describe Agent::Response do
     end
 
     sleep(1.millisecond) # let the spawned fiber block on join
-    resp.finish(Agent::Message.new(role: "assistant", content: "Done"), Agent::Usage.new)
+    resp.finish(Agent::Message.new(role: Agent::Role::Assistant, content: "Done"), Agent::Usage.new)
 
     select
     when done.receive
@@ -68,14 +68,14 @@ describe Agent::Response do
 
   it "is finished after finish is called" do
     resp = Agent::Response.new
-    spawn { resp.finish(Agent::Message.new(role: "assistant", content: ""), Agent::Usage.new) }
+    spawn { resp.finish(Agent::Message.new(role: Agent::Role::Assistant, content: ""), Agent::Usage.new) }
     resp.join
     resp.finished?.should be_true
   end
 
   it "caches message on second call" do
     resp = Agent::Response.new
-    msg = Agent::Message.new(role: "assistant", content: "Cached")
+    msg = Agent::Message.new(role: Agent::Role::Assistant, content: "Cached")
     spawn { resp.finish(msg, Agent::Usage.new) }
     resp.message.should be(msg)
     resp.message.should be(msg) # second call returns cached, not channel receive

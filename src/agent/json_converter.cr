@@ -3,8 +3,8 @@ class Agent
   # for tool parameter definitions — no more `JSON::Any.new(...)` boilerplate.
   #
   # ```
-  # params = Agent::JSONSchema.from({
-  #   type: "object",
+  # params = Agent::JSONConverter.from({
+  #   type:       "object",
   #   properties: {
   #     city: {type: "string", description: "The city name"},
   #   },
@@ -15,7 +15,11 @@ class Agent
   #   # ...
   # end
   # ```
-  module JSONSchema
+  # Backward-compatible alias — maintained for existing tool definitions.
+  # Prefer `JSONConverter` for new code.
+  JSONSchema = JSONConverter
+
+  module JSONConverter
     extend self
 
     # Convert a value to `Hash(String, JSON::Any)` recursively.
@@ -49,10 +53,10 @@ class Agent
         JSON::Any.new(value)
       elsif value.is_a?(Float32)
         JSON::Any.new(value.to_f64)
-      elsif value.is_a?(Nil)
+      elsif value.nil?
         JSON::Any.new(value)
       else
-        JSON::Any.new(value.to_s)
+        raise ArgumentError.new("JSONConverter cannot handle #{value.class}: #{value.inspect}")
       end
     end
   end
