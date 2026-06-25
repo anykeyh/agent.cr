@@ -14,6 +14,7 @@ class Agent
     getter auto_execute_tools : Bool
     getter extra_headers : Hash(String, String)?
     getter stream : Bool
+    getter max_tool_iterations : Int32?
 
     # Cached parsed URI — computed once at construction.
     getter parsed_uri : URI
@@ -31,6 +32,7 @@ class Agent
       @auto_execute_tools : Bool = true,
       @extra_headers : Hash(String, String)? = nil,
       @stream : Bool = true,
+      @max_tool_iterations : Int32? = 100,
     )
       # Validate temperature
       if (t = @temperature) && (t < 0.0 || t > 2.0)

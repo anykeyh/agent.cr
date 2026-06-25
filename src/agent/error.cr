@@ -6,8 +6,7 @@ class Agent
   # Raised when a network or connection error occurs during an API request.
   class ConnectionError < Error
     def initialize(message : String, cause : Exception? = nil)
-      super(message)
-      @cause = cause
+      super(message, cause: cause)
     end
   end
 
@@ -25,8 +24,7 @@ class Agent
     getter tool_name : String
 
     def initialize(@tool_name : String, message : String, cause : Exception? = nil)
-      super(message)
-      @cause = cause
+      super(message, cause: cause)
     end
   end
 end

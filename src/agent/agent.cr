@@ -211,8 +211,20 @@ class Agent
     # ameba:disable Lint/NotNil
     messages = request.messages.not_nil!
     tools = request.tools
+    max_iter = @config.max_tool_iterations
+    iteration = 0
 
     loop do
+      iteration += 1
+
+      # Bail out if the model is stuck in a tool-call loop.
+      if max_iter && iteration > max_iter
+        err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
+        err = ConnectionError.new(err_msg)
+        response.finish_with_error(err)
+        break
+      end
+
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
       # On error, http_post_stream already called response.finish/finish_with_error — stop.
@@ -220,9 +232,13 @@ class Agent
         break
       end
 
+      # Append the assistant message to history before any decision.
+      @history << msg
+
       # If no tool calls, or auto_execute is disabled, or no registered tools — done.
       no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools || @registered_tools.empty?
       if no_tools
+        trim_history!
         response.finish(msg, usage, finish_reason: finish_reason)
         break
       end
@@ -233,15 +249,28 @@ class Agent
 
       # If some tools had no registered handler, stop and let the caller handle it.
       if results.empty?
+        trim_history!
         response.finish(msg, usage, finish_reason: finish_reason)
         break
       end
 
       # Append tool results to history, then prepare next iteration.
-      # We build messages from an empty append array because @history already
-      # contains everything (including the results we just appended).
       @history.concat(results)
       messages = build_messages([] of Message)
+    end
+  end
+
+  # Trim history to respect max_history config, applied only after a
+  # complete user—>assistant turn (not during intermediate tool-call steps).
+  private def trim_history! : Nil
+    if (max = @config.max_history) && max > 0
+      msg_count = @history.count { |m| m.role == Role::User || m.role == Role::Assistant }
+      if msg_count > max * 2
+        remove = @history.size - msg_count + max * 2
+        remove = {remove, @history.size}.min
+        remove = {remove, 0}.max
+        @history.shift(remove)
+      end
     end
   end
 
@@ -329,20 +358,6 @@ class Agent
           process_sse_stream(http_resp.body_io, response)
 
         final_message = build_final_message(content_buffer, reasoning_buffer, tool_call_deltas)
-
-        @history << final_message
-
-        # Trim history: estimate one turn as 2 messages per user/assistant pair,
-        # but also count tool messages which may appear between user and assistant.
-        if (max = @config.max_history) && max > 0
-          msg_count = @history.count { |m| m.role == Role::User || m.role == Role::Assistant }
-          if msg_count > max * 2
-            remove = @history.size - msg_count + max * 2
-            remove = {remove, @history.size}.min
-            remove = {remove, 0}.max
-            @history.shift(remove)
-          end
-        end
 
         {final_message, usage, finish_reason}
       end
