@@ -468,10 +468,11 @@ class Agent
         fn_h = fn.as_h
         if fn_h_name = fn_h["name"]?
           entry.name += fn_h_name.as_s
+          response.push_chunk(Response::Chunk.new(fn_h_name.as_s, Response::ChunkKind::ToolCallName))
         end
         if fn_h_args = fn_h["arguments"]?
           entry.arguments += fn_h_args.as_s
-          response.push_chunk(Response::Chunk.new(fn_h_args.as_s, Response::ChunkKind::ToolCall))
+          response.push_chunk(Response::Chunk.new(fn_h_args.as_s, Response::ChunkKind::ToolCallArgs))
         end
       end
     end

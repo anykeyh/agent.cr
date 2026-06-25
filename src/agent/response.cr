@@ -9,7 +9,8 @@ class Agent
     enum ChunkKind
       Content
       Reasoning
-      ToolCall
+      ToolCallArgs
+      ToolCallName
     end
 
     # A streamed text chunk tagged with its origin.
@@ -26,6 +27,14 @@ class Agent
 
       def reasoning? : Bool
         @kind == ChunkKind::Reasoning
+      end
+
+      def tool_call_name? : Bool
+        @kind == ChunkKind::ToolCallName
+      end
+
+      def tool_call_args? : Bool
+        @kind == ChunkKind::ToolCallArgs
       end
     end
 

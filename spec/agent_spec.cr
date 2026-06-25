@@ -298,7 +298,7 @@ describe Agent do
 
       tool_chunks = [] of String
       resp.stream do |chunk|
-        if chunk.kind == Agent::Response::ChunkKind::ToolCall
+        if chunk.kind == Agent::Response::ChunkKind::ToolCallArgs
           tool_chunks << chunk.text
         end
       end
