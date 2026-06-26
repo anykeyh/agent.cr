@@ -1,5 +1,8 @@
+require "dotenv"
 require "colorize"
 require "../src/agent"
+
+Dotenv.load(".env.local")
 
 # Example: Describe attachments using a multimodal model.
 #
@@ -12,13 +15,13 @@ require "../src/agent"
 #   crystal run examples/describe_attachments.cr -- ./doc.pdf --model gpt-4o
 #
 # Environment variables:
-#   LLM_API_KEY     — API key (optional for local endpoints)
-#   LLM_ENDPOINT    — API base URL (default: http://ai.local.amplitude-solutions.com/llm/)
+#   LLM_API_KEY     — API key
+#   LLM_ENDPOINT    — API base URL (default: https://api.openai.com/v1)
 #   LLM_MODEL       — Model name  (default: gpt-4o)
 
 STDOUT.sync = true
 
-endpoint = ENV["LLM_ENDPOINT"]? || "http://ai.local.amplitude-solutions.com/llm/"
+endpoint = ENV["LLM_ENDPOINT"]? || "https://api.openai.com/v1"
 model = ENV["LLM_MODEL"]? || "gpt-4o"
 api_key = ENV["LLM_API_KEY"]?
 

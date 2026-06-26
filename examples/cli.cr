@@ -1,5 +1,8 @@
+require "dotenv"
 require "colorize"
 require "../src/agent"
+
+Dotenv.load(".env.local")
 
 # Example: Minimal interactive CLI chat with streaming output and registered tools.
 # Demonstrates dynamic tool registration mid-conversation via the `true_randomness`
@@ -14,13 +17,13 @@ require "../src/agent"
 #   /exit, /quit — quit
 #
 # Environment variables:
-#   LLM_API_KEY     — API key (optional for local endpoints)
-#   LLM_ENDPOINT    — API base URL (default: http://ai.local.amplitude-solutions.com/llm/)
+#   LLM_API_KEY     — API key
+#   LLM_ENDPOINT    — API base URL (default: https://api.openai.com/v1)
 #   LLM_MODEL       — Model name  (default: gpt-4o)
 
 STDOUT.sync = true
 
-endpoint = ENV["LLM_ENDPOINT"]? || "http://ai.local.amplitude-solutions.com/llm/"
+endpoint = ENV["LLM_ENDPOINT"]? || "https://api.openai.com/v1"
 model = ENV["LLM_MODEL"]? || "gpt-4o"
 api_key = ENV["LLM_API_KEY"]?
 

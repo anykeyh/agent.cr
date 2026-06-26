@@ -24,6 +24,8 @@ shards install
 
 > Built with Crystal >= 1.10
 
+> **Thread safety:** The shard is designed to be multi-thread compatible — all shared state uses `Sync::Mutex` and `Sync::Exclusive` under the hood. However, it is currently tested and developed **without** the `-Dpreview_mt` flag. If you run with `preview_mt`, your mileage may vary. Contributions welcome.
+
 ---
 
 ## Quick start
@@ -450,6 +452,35 @@ agent = Agent.new(config)
 # vs restored session with the same cache_key
 agent = Agent.load(config, saved_session_string)
 ```
+
+---
+
+## Examples
+
+### 🎲 Dungeons & Dragons — Text Adventure
+
+`examples/rpg.cr` is a fully playable D&D-style parody adventure. You pick a hero class, the LLM becomes your Dungeon Master, and game mechanics (HP, damage, ability checks, inventory) are enforced by registered Crystal tools — no cheating allowed, not even for the DM.
+
+```sh
+crystal run examples/rpg.cr
+```
+
+**How it works:**
+
+- The system prompt instructs the DM to narrate in the spirit of *Le Donjon de Naheulbeuk* and Monty Python — absurdist, self-aware, and allergic to drama.
+- Twelve registered tools (`roll_check`, `take_damage`, `heal`, `add_item`, etc.) handle all rule interactions. The DM calls them via function calling; the agent auto-resolves them in the background.
+- Sessions auto-save after every turn. You can quit, come back, and resume exactly where you left off — the agent's history and session identity are preserved.
+- Reasoning tokens (DeepSeek, Qwen, etc.) are hidden behind a spinner: *"The DM is preparing your adventure..."* while the model thinks, then replaced by the actual narration.
+- Tool call internals are kept off-screen. The DM narrates outcomes naturally — you see roll *"🎲 15 — Success!"* as prose.
+
+**Game mechanics? More like game *suggestions*.** The DM has tools, yes. The DM *should* use them. But nobody said the DM was competent. Every `roll_check` is faithfully executed by Crystal, but whether the DM remembers to call `is_alive` after dealing damage is entirely between them and their questionable deity. The wizard has a spellbook; the rogue has lockpicks, and the warrior a _big fat sword_.
+
+```sh
+# Optional flags:
+crystal run examples/rpg.cr -- --endpoint http://localhost:8080/v1 --model llama3
+```
+
+Hero classes include Fighter (solves problems with violence), Wizard (solves problems with different violence), Rogue (solves problems by pretending they aren't there), and Cleric (solves problems by lecturing everyone about it). Sessions are saved to `examples/rpg/`. Try `/hero` to see your sheet, `/reset` when you inevitably die, and `/help` when you forget which button does what.
 
 ---
 

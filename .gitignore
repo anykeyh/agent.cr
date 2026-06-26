@@ -1,3 +1,4 @@
+.env.local
 lib
 bin/ameba
 examples/rpg/*.json

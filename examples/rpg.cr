@@ -1,7 +1,10 @@
+require "dotenv"
 require "colorize"
 require "json"
 require "time"
 require "../src/agent"
+
+Dotenv.load(".env.local")
 
 # DnD RPG — An interactive dungeon-crawling adventure using registered tools.
 #
@@ -19,9 +22,9 @@ require "../src/agent"
 #   crystal run examples/rpg.cr -- --endpoint http://localhost:8080/v1 --model llama3
 #
 # Environment variables:
-#   LLM_API_KEY     — API key (optional for local endpoints)
-#   LLM_ENDPOINT    — API base URL
-#   LLM_MODEL       — Model name
+#   LLM_API_KEY     — API key
+#   LLM_ENDPOINT    — API base URL (default: https://api.openai.com/v1)
+#   LLM_MODEL       — Model name  (default: gpt-4o)
 
 STDOUT.sync = true
 
@@ -208,7 +211,7 @@ end
 # ──────────────────────────────────────────────────────────────────────────────
 # Parse CLI arguments
 # ──────────────────────────────────────────────────────────────────────────────
-endpoint = ENV["LLM_ENDPOINT"]? || "http://ai.local.amplitude-solutions.com/llm/"
+endpoint = ENV["LLM_ENDPOINT"]? || "https://api.openai.com/v1"
 model = ENV["LLM_MODEL"]? || "gpt-4o"
 api_key = ENV["LLM_API_KEY"]?
 
@@ -884,7 +887,7 @@ unless resumed
   end
 end
 
-puts "── Commands: /hero  /reset  /exit  /help ──".colorize(:dark_gray)
+puts "── Commands: /hero  /reset  /exit  /help - Ctrl+D to send ──".colorize(:dark_gray)
 puts
 
 # Stream response chunks with reasoning hidden behind a "The DM is preparing your adventure..."
