@@ -41,7 +41,7 @@ class Agent
   end
 
   # Internal request types sent to the processing fiber.
-  private record AskRequest, messages : Array(Message), tools : Array(Tool)?, response : Response
+  private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response
   private record ResetRequest, response : Response
   private record RegisterToolRequest,
     name : String,
@@ -61,7 +61,7 @@ class Agent
   @closed = false
   @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String))
 
-  # Persistent HTTP client for connection pooling.
+  # Persistent HTTP client for connection pooling across requests.
   @http_client : HTTP::Client
 
   def initialize(@config : Config)
@@ -156,8 +156,7 @@ class Agent
           end
 
     response = Response.new
-    @request_channel.send(AskRequest.new(build_messages([msg]), tools, response))
-    @history << msg
+    @request_channel.send(AskRequest.new([msg], tools, response))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -171,8 +170,7 @@ class Agent
     raise ClosedError.new if @closed
 
     response = Response.new
-    @request_channel.send(AskRequest.new(build_messages(tool_results), tools, response))
-    @history.concat(tool_results)
+    @request_channel.send(AskRequest.new(tool_results, tools, response))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -328,10 +326,14 @@ class Agent
   # model — all within this fiber, without returning to the caller.
   private def process_request_loop(request : AskRequest) : Nil
     response = request.response
-    messages = request.messages
     tools = request.tools
     max_iter = @config.max_tool_iterations
     iteration = 0
+
+    # Append new messages to history and build the request body.
+    # By appending on the fiber, we avoid concurrent mutations from caller fibers.
+    @history.concat(request.new_messages)
+    messages = build_messages([] of Message)
 
     loop do
       iteration += 1
@@ -339,15 +341,17 @@ class Agent
       # Bail out if the model is stuck in a tool-call loop.
       if max_iter && iteration > max_iter
         err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
-        err = ConnectionError.new(err_msg)
+        err = ToolLoopError.new(max_iter, err_msg)
         response.finish_with_error(err)
         break
       end
 
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
-      # On error, http_post_stream already called response.finish/finish_with_error — stop.
+      # On error, http_post_stream already called response.finish/finish_with_error.
+      # Append the synthetic error message to keep history well-formed.
       if response.error?
+        @history << msg
         break
       end
 
@@ -379,7 +383,7 @@ class Agent
         break
       end
 
-      # Append tool results to history, then prepare next iteration.
+      # Append tool results to history, then rebuild messages for next iteration.
       @history.concat(results)
       messages = build_messages([] of Message)
     end
@@ -407,8 +411,8 @@ class Agent
         break if keep <= 0
         if m.role == Role::User || m.role == Role::Assistant
           keep -= 1
+          dropped = i + 1
         end
-        dropped = i + 1
       end
 
       # Never split a tool-call group: if the cut point lands in the
@@ -521,17 +525,25 @@ class Agent
         content_buffer, reasoning_buffer, tool_call_deltas, usage, finish_reason =
           process_sse_stream(http_resp.body_io, response)
 
+        # If the response was cancelled mid-stream, treat it as an error.
+        if response.cancelled?
+          raise CancelledError.new
+        end
+
         final_message = build_final_message(content_buffer, reasoning_buffer, tool_call_deltas)
 
         {final_message, usage, finish_reason}
       end
     rescue ex : ApiError
       response.finish_with_error(ex)
-      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message}"), Usage.new, nil}
+      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
+    rescue ex : CancelledError
+      response.finish_with_error(ex)
+      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
     rescue ex
-      err = ConnectionError.new(ex.message || "Unknown error", cause: ex)
+      err = ConnectionError.new(ex.message || ex.class.name, cause: ex)
       response.finish_with_error(err)
-      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message}"), Usage.new, nil}
+      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
     end
   end
 
@@ -719,11 +731,16 @@ class Agent
 
   private def build_request_body(messages : Array(Message), tools : Array(Tool)?) : Hash(String, JSON::Any)
     body = {
-      "model"            => JSON::Any.new(@config.model),
-      "prompt_cache_key" => JSON::Any.new(@cache_key),
-      "messages"         => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
-      "stream"           => JSON::Any.new(true),
+      "model"    => JSON::Any.new(@config.model),
+      "messages" => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
+      "stream"   => JSON::Any.new(true),
     }
+
+    # Only send prompt_cache_key if it was explicitly configured.
+    # Non-OpenAI providers may reject unknown fields.
+    if @config.prompt_cache_key
+      body["prompt_cache_key"] = JSON::Any.new(@cache_key)
+    end
 
     if mt = @config.max_tokens
       body["max_tokens"] = JSON::Any.new(mt.to_i64)

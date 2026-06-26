@@ -19,12 +19,19 @@ class Agent
     end
   end
 
-  # Raised when a tool callback raises an exception during auto-execution.
-  class ToolError < Error
-    getter tool_name : String
+  # Raised when the automatic tool-resolution loop exceeds the iteration limit.
+  class ToolLoopError < Error
+    getter max_iterations : Int32
 
-    def initialize(@tool_name : String, message : String, cause : Exception? = nil)
-      super(message, cause: cause)
+    def initialize(@max_iterations : Int32, message : String)
+      super(message)
+    end
+  end
+
+  # Raised when the caller cancels an in-flight response.
+  class CancelledError < Error
+    def initialize
+      super("Response was cancelled by caller")
     end
   end
 end

@@ -20,7 +20,7 @@ class Agent
 
     # Parse from a lowercase string. Raises ArgumentError for invalid input.
     def self.parse(value : String) : Role
-      case value.downcase
+      case value.strip.downcase
       when "system"    then System
       when "user"      then User
       when "assistant" then Assistant
@@ -50,9 +50,9 @@ class Agent
 
     getter text : String?
     getter image_url : String?
-    getter image_detail : String?
+    getter image_detail : String
 
-    def initialize(@text : String? = nil, @image_url : String? = nil, @image_detail : String = "auto")
+    def initialize(@text : String? = nil, @image_url : String? = nil, @image_detail : String? = "auto")
       if @text.nil? && @image_url.nil?
         raise ArgumentError.new("ContentPart must have either text or image_url")
       end
@@ -65,7 +65,7 @@ class Agent
           "type"      => JSON::Any.new("image_url"),
           "image_url" => JSON::Any.new({
             "url"    => JSON::Any.new(url),
-            "detail" => JSON::Any.new(@image_detail || "auto"),
+            "detail" => JSON::Any.new(@image_detail),
           }.to_h),
         }
       else
@@ -147,6 +147,7 @@ class Agent
 
     def ==(other : self) : Bool
       @role == other.role && @content == other.content &&
+        @content_parts == other.content_parts &&
         @tool_call_id == other.tool_call_id && @name == other.name &&
         @tool_calls == other.tool_calls && @reasoning == other.reasoning
     end
@@ -159,7 +160,7 @@ class Agent
       io << "#<Message:"
       io << @role.to_s
       if c = @content
-        io << " #{c[0, {c.size, 80}.min].inspect}"
+        io << " #{c[0, Math.min(c.size, 80)].inspect}"
       elsif @content_parts
         io << " (multimodal)"
       end
@@ -181,6 +182,8 @@ class Agent
         body["content"] = JSON::Any.new(parts.map(&.to_json_body).map { |h| JSON::Any.new(h) })
       elsif text = @content
         body["content"] = JSON::Any.new(text)
+      elsif @role == Role::Tool
+        body["content"] = JSON::Any.new("")
       else
         body["content"] = JSON::Any.new(nil)
       end

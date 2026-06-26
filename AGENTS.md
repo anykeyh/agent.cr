@@ -32,7 +32,6 @@ sequenceDiagram
     participant API as OpenAI API
 
     Caller->>Agent: ask("hello")
-    Agent->>Agent: build Message, append to history
     Agent->>Fiber: send(Request) on @request_channel
     Agent-->>Caller: return Response (immediately)
 
@@ -71,16 +70,18 @@ fiber — no locking needed.
 
 ### Request / Response decoupling
 
-`#ask` does three things synchronously:
+`#ask` does two things synchronously:
 1. Builds a `Message`
-2. Creates a fresh `Response` object and sends a `Request` (messages + tools + response)
-3. Appends the message to `@history` only after the channel send succeeds
+2. Creates a fresh `Response` object and sends an `AskRequest` (new_messages + tools + response) on `@request_channel`
+
+The fiber receives the request in `process_request_loop` (L327) and appends the
+messages to `@history` inside the fiber (L335), ensuring single-owner mutation.
 
 It returns the `Response` immediately. The calling fiber is free to read
 chunks, wait for the message, or do other work.
 
-Appending to `@history` after the send ensures that if `close()` races with
-`#ask()`, an orphan message is never left in history.
+Appending inside the fiber (rather than in `#ask`) avoids races between
+`close()` and `#ask()` — the fiber owns history exclusively.
 
 ### Buffered chunk channel
 
@@ -194,9 +195,12 @@ transfers control to the agent fiber. No explicit `Fiber.yield` is needed.
 
 ### Channel close ordering
 
-`finish` sends to `message_channel` and `usage_channel` *before* closing
-`chunk_channel`, and also captures the `finish_reason` from the API
-("stop", "length", "tool_calls", etc.) exposed as `Response#finish_reason`.
+`finish` and `finish_with_error` both send to `message_channel` and `usage_channel`
+*before* closing `chunk_channel`. Additionally:
+- `finish` captures the `finish_reason` from the API ("stop", "length",
+  "tool_calls", etc.) exposed as `Response#finish_reason`.
+- `finish_with_error` (response.cr L158-168) stores an `Agent::Error` and
+  sends a synthetic error message so `#message` always unblocks.
 
 This ordering matters:
 - The consumer (blocked on `#message` or `#metadata`) can unblock before
@@ -222,8 +226,11 @@ so callers can pattern-match programmatically.
 
 If `http_post_stream` raises (network error, non-200 status, JSON parse
 failure), the error is caught in `http_post_stream`'s own rescue block, which
-calls `response.finish` with an error message. This ensures `#message` and
-`#join` always unblock.
+calls `response.finish_with_error` with an `Agent::Error`. This ensures
+`#message` and `#join` always unblock. A `CancelledError` is raised when
+the caller calls `#cancel` on the response — the HTTP fiber checks the
+cancel channel after each SSE line and aborts cleanly, calling
+`finish_with_error(CancelledError.new)`.
 
 ## Development workflow
 
@@ -384,22 +391,22 @@ while msg.has_tool_calls?
 end
 
 # NEW: 5 lines, no while-loop
-agent.register_tool("get_time", ...) { |args| ... }
+agent.register_tool("get_time", "Get the current time",
+  parameters: Agent::JSONConverter.from({
+    type:       "object",
+    properties: {} of String => String,
+    required:   [] of String,
+  })
+) { |args| ... }
 resp = agent.ask(input)
 resp.stream { |chunk| print chunk }
 ```
 
 ## Future considerations
 
-- **Request cancellation** — A cancel channel could be added to `Response`
-  so that `#ask` can abort an in-flight request.
-
 - **Non-streaming fallback** — Some providers don't support streaming. A
   non-streaming `POST` path could detect `stream` support in the response
   headers and fall back.
-
-- **Connection pooling** — Currently each request creates a new
-  `HTTP::Client`. Reusing a persistent client would reduce latency.
 
 - **Request timeout** — Timeouts (`read_timeout`, `connect_timeout`) are
   configurable via `Config` but default to `nil` (no timeout). Setting

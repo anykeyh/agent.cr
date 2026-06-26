@@ -66,6 +66,8 @@ class Agent
     # Request cancellation of this in-flight response.
     # The HTTP fiber will abort after the current SSE line is processed.
     # Safe to call from any fiber. Idempotent.
+    # After cancellation, #message returns a "Agent error: cancelled" message
+    # and #error returns a CancelledError.
     def cancel : Nil
       return if @cancelled
 
@@ -142,10 +144,10 @@ class Agent
     def finish(message : Message, usage : Usage, finish_reason : String? = nil) : Nil
       return if @done
 
-      @done = true
       @finish_reason = finish_reason
       @message_channel.send(message)
       @usage_channel.send(usage)
+      @done = true
     ensure
       @chunk_channel.close
     end
@@ -156,11 +158,11 @@ class Agent
     def finish_with_error(err : Agent::Error) : Nil
       return if @done
 
-      @done = true
       @error = err
       error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
       @message_channel.send(error_msg)
       @usage_channel.send(Usage.new)
+      @done = true
     ensure
       @chunk_channel.close
     end

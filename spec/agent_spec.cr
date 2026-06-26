@@ -775,9 +775,11 @@ describe Agent do
       # Cancel immediately — the SSE stream should stop early
       resp.cancel
 
-      # The response should still complete (finish_with_error or finish)
+      # The response should complete with an error (CancelledError)
       resp.join
       resp.finished?.should be_true
+      resp.error?.should be_true
+      resp.error.should be_a(Agent::CancelledError)
     end
   end
 
@@ -839,6 +841,284 @@ describe Agent do
         resp.message.content.should_not be_nil
         resp.finished?.should be_true
       end
+    end
+  end
+
+  it "dump/load round-trip preserves session_id, cache_key, and history" do
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count = (ctx.request.body.try(&.gets_to_end) || "").size # just to force reading
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        reply = "Response #{call_count}"
+        reply.each_char do |ch|
+          data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+          ctx.response.puts "data: #{data}"
+          ctx.response.flush
+        end
+        final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => reply.size, "total_tokens" => 10 + reply.size}}.to_json
+        ctx.response.puts "data: #{final}"
+        ctx.response.puts "data: [DONE]"
+        ctx.response.flush
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      original = Agent.new(config)
+      resp1 = original.ask("First message")
+      resp1.join
+
+      session_id = original.session_id
+      cache_key = original.cache_key
+      history_size = original.history.size
+
+      # Dump to JSON string
+      dump_str = original.dump
+      dump_str.should be_a(String)
+
+      # Load into a new agent with the same config
+      restored = Agent.load(config, dump_str)
+
+      # Verify restored fields
+      restored.session_id.should eq(session_id)
+      restored.cache_key.should eq(cache_key)
+      restored.history.size.should eq(history_size)
+
+      # Verify the loaded agent can continue the conversation
+      resp2 = restored.ask("Continue")
+      resp2.join
+      resp2.message.content.should_not be_nil
+      resp2.finished?.should be_true
+    ensure
+      server.close
+    end
+  end
+
+  it "trims history with tool calls and max_history leaving no orphaned tool messages" do
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count <= 2
+          # First two calls return tool calls
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_#{call_count}", "type" => "function", "function" => {"name" => "my_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"test"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 5, "completion_tokens" => 5, "total_tokens" => 10}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          # Third call returns plain text (triggers trim)
+          reply = "final result"
+          reply.each_char do |ch|
+            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+            ctx.response.puts "data: #{data}"
+            ctx.response.flush
+          end
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => reply.size, "total_tokens" => 10 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        max_history: 1,
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      agent.register_tool("my_tool", "A test tool",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            input: {type: "string"},
+          },
+          required: ["input"],
+        })
+      ) do |args|
+        "processed: #{args["input"]?.try(&.as_s)}"
+      end
+
+      # First turn: user -> tool_calls -> tool_result -> assistant(final) = 4 messages
+      resp1 = agent.ask("First")
+      resp1.join
+
+      # Second turn: same pattern, triggers trim after auto-resolve
+      resp2 = agent.ask("Second")
+      resp2.join
+
+      # With max_history=1, only the last complete turn should survive (2 messages)
+      agent.history.size.should eq(2)
+      agent.history[0].role.should eq(Agent::Role::User)
+      agent.history[0].content.should eq("Second")
+      agent.history[1].role.should eq(Agent::Role::Assistant)
+      agent.history[1].content.should eq("final result")
+      agent.history[1].has_tool_calls?.should be_false
+    ensure
+      server.close
+    end
+  end
+
+  it "register_tool from inside a callback works for in-fiber registration" do
+    call_count = 0
+    second_tool_called = false
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          # First request: return tool call for first_tool
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "first_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"hello"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        elsif call_count == 2
+          # Second request: return tool call for second_tool
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_002", "type" => "function", "function" => {"name" => "second_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"world"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          # Third request: return final text
+          reply = "Both tools executed successfully"
+          reply.each_char do |ch|
+            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+            ctx.response.puts "data: #{data}"
+            ctx.response.flush
+          end
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      # Register first_tool — its callback will register second_tool
+      agent.register_tool("first_tool", "First tool",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            input: {type: "string"},
+          },
+          required: ["input"],
+        })
+      ) do |args|
+        # Register second_tool from inside the callback (in-fiber registration path)
+        agent.register_tool("second_tool", "Second tool",
+          parameters: Agent::JSONConverter.from({
+            type:       "object",
+            properties: {
+              input: {type: "string"},
+            },
+            required: ["input"],
+          })
+        ) do |args2|
+          second_tool_called = true
+          "second_result: #{args2["input"]?.try(&.as_s)}"
+        end
+        "first_result: #{args["input"]?.try(&.as_s)}"
+      end
+
+      resp = agent.ask("Run both tools")
+      resp.join
+
+      resp.message.content.should eq("Both tools executed successfully")
+      second_tool_called.should be_true
+
+      # History should have: user, assistant(tool_calls), tool, assistant(tool_calls), tool, assistant(final) = 6
+      agent.history.size.should eq(6)
+      agent.history[0].role.should eq(Agent::Role::User)
+      agent.history[1].role.should eq(Agent::Role::Assistant)
+      agent.history[1].has_tool_calls?.should be_true
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[2].content.to_s.should contain("first_result")
+      agent.history[3].role.should eq(Agent::Role::Assistant)
+      agent.history[3].has_tool_calls?.should be_true
+      agent.history[4].role.should eq(Agent::Role::Tool)
+      agent.history[4].content.to_s.should contain("second_result")
+      agent.history[5].role.should eq(Agent::Role::Assistant)
+      agent.history[5].content.should eq("Both tools executed successfully")
+    ensure
+      server.close
     end
   end
 end

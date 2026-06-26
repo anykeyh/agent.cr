@@ -79,7 +79,7 @@ calls inline — no manual while-loop needed.
 
 ```crystal
 # Define the JSON Schema parameters using a plain Crystal NamedTuple
-params = Agent::JSONSchema.from({
+params = Agent::JSONConverter.from({
   type: "object",
   properties: {
     city: {type: "string", description: "The city name"},
@@ -150,7 +150,7 @@ To feed results back to the model:
 ```crystal
 results = resp.message.tool_calls.not_nil!.map do |tc|
   Agent::Message.new(
-    role: "tool",
+    role: Agent::Role::Tool,
     content: execute_tool(tc),
     tool_call_id: tc.id,
     name: tc.name,
@@ -184,16 +184,19 @@ execute → ask again — until the model responds with content.
 
 ```crystal
 Agent::Config.new(
-  api_key:            String,           # required
-  api_endpoint:       String,           # default: "https://api.openai.com/v1"
-  model:              String,           # default: "gpt-4o"
-  system_prompt:      String?,          # optional system message
-  max_tokens:         Int32?,           # optional max completion tokens
-  temperature:        Float64?,         # optional sampling temperature
-  read_timeout:       Time::Span?,      # optional HTTP read timeout
-  connect_timeout:    Time::Span?,      # optional HTTP connect timeout
-  max_history:        Int32?,           # optional max conversation turns
-  auto_execute_tools: Bool,             # default: true
+  api_key:            String,              # required
+  api_endpoint:       String,              # default: "https://api.openai.com/v1"
+  model:              String,              # default: "gpt-4o"
+  system_prompt:      String?,             # optional system message
+  max_tokens:         Int32?,              # optional max completion tokens
+  temperature:        Float64?,            # optional sampling temperature
+  read_timeout:       Time::Span?,         # optional HTTP read timeout
+  connect_timeout:    Time::Span?,         # optional HTTP connect timeout
+  max_history:        Int32?,              # optional max conversation turns
+  auto_execute_tools: Bool,                # default: true
+  extra_headers:      Hash(String, String)?, # optional extra HTTP headers
+  max_tool_iterations: Int32?,             # optional max tool call iterations (default: 100)
+  prompt_cache_key:   String?,             # optional explicit prompt cache key
 )
 ```
 

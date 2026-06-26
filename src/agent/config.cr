@@ -39,6 +39,7 @@ class Agent
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)
       validate_max_history(@max_history)
+      validate_max_tool_iterations(@max_tool_iterations)
 
       # Accept Int32 seconds for timeouts (convenience)
       @read_timeout = parse_timeout(read_timeout)
@@ -69,6 +70,12 @@ class Agent
       end
     end
 
+    private def validate_max_tool_iterations(mti : Int32?) : Nil
+      if mti && mti < 1
+        raise ArgumentError.new("max_tool_iterations must be >= 1, got #{mti}")
+      end
+    end
+
     private def parse_timeout(timeout : Time::Span | Int32 | Nil) : Time::Span?
       case timeout
       when Int32      then timeout.seconds
@@ -79,7 +86,7 @@ class Agent
 
     # The chat completions path derived from api_endpoint.
     def chat_path : String
-      base_path = @parsed_uri.path.empty? || @parsed_uri.path == "/" ? "" : @parsed_uri.path.gsub(/\/+$/, "")
+      base_path = @parsed_uri.path.empty? || @parsed_uri.path == "/" ? "" : @parsed_uri.path.rstrip('/')
       "#{base_path}/chat/completions"
     end
   end

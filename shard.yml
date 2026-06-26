@@ -5,7 +5,7 @@ description: |
   A Crystal shard for building agentic loops with OpenAI-compatible APIs.
 
 authors:
-  - Héberloup (anykeyh) <heberloup@pm.me>
+  - Yacine Petitprez <anykeyh@gmail.com>
 
 crystal: ">= 1.10"
 
