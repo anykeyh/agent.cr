@@ -22,7 +22,7 @@ Then run:
 shards install
 ```
 
-> Built with Crystal >= 1.20.2+
+> Built with Crystal >= 1.10
 
 ---
 
@@ -378,7 +378,7 @@ Agent::Config.new(
   temperature:        Float64?,            # optional sampling temperature (0.0-2.0)
   read_timeout:       Time::Span | Int32?, # optional HTTP read timeout (seconds or span)
   connect_timeout:    Time::Span | Int32?, # optional HTTP connect timeout (seconds or span)
-  max_history:        Int32?,              # optional max conversation turns (0 disables)
+  max_history:        Int32?,              # optional max conversation turns (0 or nil = no limit)
   auto_execute_tools: Bool,                # default: true
   extra_headers:      Hash(String, String)?, # optional extra HTTP headers
   max_tool_iterations: Int32?,             # default: 100 — safety limit for tool loops
@@ -412,6 +412,9 @@ Error types:
 | `Agent::ConnectionError` | Network / connection failure |
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |
+| `Agent::ToolArgumentError` | Tool call arguments don't match the parameter schema (includes `.tool_name`) |
+| `Agent::SessionLoadError` | Loading a saved session failed due to corrupt or missing fields |
+| `Agent::ClosedError` | An operation was attempted on a closed agent |
 
 ---
 
@@ -431,7 +434,7 @@ config = Agent::Config.new(
 
 ### Cleanup
 
-Close the agent when done to shut down the background fiber and release the HTTP connection pool:
+Close the agent when done to shut down the background fiber and release the HTTP connection pool. **Important:** Dropping the reference without calling `#close` leaks the background fiber — it will block indefinitely waiting for requests on its channel.
 
 ```crystal
 agent.close

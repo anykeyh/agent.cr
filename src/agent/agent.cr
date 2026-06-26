@@ -1,5 +1,6 @@
 require "json"
 require "http/client"
+require "sync"
 
 class Agent
   # Raised when trying to use an Agent that has been closed.
@@ -10,28 +11,36 @@ class Agent
   end
 
   # Internal request types sent to the processing fiber.
+  # After the mutex migration, only AskRequest remains on the channel.
+  # All control operations (register_tool, enable_tool, reset, etc.) now use
+  # direct mutex-protected access instead of channel round-trips.
   private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response
-  private record ResetRequest, response : Response
-  private record RegisterToolRequest,
-    name : String,
-    tool : Tool,
-    callback : (Hash(String, JSON::Any) -> String)?,
-    enabled : Bool,
-    response : Response
-  private record EnableToolRequest, name : String, enabled : Bool, response : Response
-  private record LoadHistoryRequest, messages : Array(Message), response : Response
 
-  private alias Request = AskRequest | ResetRequest | RegisterToolRequest | EnableToolRequest | LoadHistoryRequest
+  private alias Request = AskRequest
 
   getter config : Config
-  getter history : Array(Message)
   getter session_id : String
   getter cache_key : String
+
+  # Return a snapshot of the conversation history.
+  # Thread-safe; acquires @history_mutex internally.
+  def history : Array(Message)
+    @history_mutex.synchronize { @history.dup }
+  end
 
   @request_channel : Channel(Request)
   @fiber : Fiber
   @closed = false
   @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool))
+  @history : Array(Message)
+
+  # Mutexes for shared state.
+  # @state_mutex protects @closed (used by close and the @closed checks).
+  # @history_mutex protects @history (used by process_request_loop, reset, load_history, snapshot).
+  # @tools_mutex protects @registered_tools (used by register/enable/disable tool, snapshot).
+  @state_mutex : Sync::Mutex
+  @history_mutex : Sync::Mutex
+  @tools_mutex : Sync::Mutex
 
   # Persistent HTTP client for connection pooling across requests.
   @http_client : HTTP::Client
@@ -44,6 +53,9 @@ class Agent
     @history = [] of Message
     @request_channel = Channel(Request).new
     @registered_tools = {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
+    @state_mutex = Sync::Mutex.new
+    @history_mutex = Sync::Mutex.new
+    @tools_mutex = Sync::Mutex.new
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @http_client = build_http_client
     @fiber = spawn { run_loop }
@@ -55,6 +67,9 @@ class Agent
     @history = [] of Message
     @request_channel = Channel(Request).new
     @registered_tools = {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
+    @state_mutex = Sync::Mutex.new
+    @history_mutex = Sync::Mutex.new
+    @tools_mutex = Sync::Mutex.new
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @http_client = build_http_client
     @fiber = spawn { run_loop }
@@ -65,6 +80,9 @@ class Agent
   #
   # The callback receives the parsed JSON arguments and returns a string result.
   # The tool definition is automatically included in all subsequent #ask calls.
+  #
+  # No longer uses a channel round-trip — acquires @tools_mutex directly.
+  # Safe to call from any fiber, including the agent fiber itself.
   #
   # ```
   # agent.register_tool("get_weather", "Get the weather for a city",
@@ -81,38 +99,25 @@ class Agent
   # end
   # ```
   def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, enabled : Bool = true, &block : Hash(String, JSON::Any) -> String) : Nil
-    raise ClosedError.new if @closed
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
     raise ArgumentError.new("Tool name must not be empty") if name.empty?
 
     tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
     entry = {tool: tool, callback: block, enabled: enabled}
 
-    if Fiber.current == @fiber
-      # Already inside the agent fiber — mutate directly to avoid deadlock.
-      @registered_tools[name] = entry
-    else
-      # From another fiber — route through the request channel for ordering.
-      response = Response.new
-      @request_channel.send(RegisterToolRequest.new(name, tool, block, enabled, response))
-      response.join
-    end
+    @tools_mutex.synchronize { @registered_tools[name] = entry }
   end
 
   # Enable a previously registered tool, making it available to the model.
   # Returns `false` if no tool with that name is registered.
   # Safe to call from any fiber.
   def enable_tool(name : String) : Bool
-    raise ClosedError.new if @closed
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
 
-    if Fiber.current == @fiber
+    @tools_mutex.synchronize do
       return false unless @registered_tools.has_key?(name)
       @registered_tools[name] = @registered_tools[name].merge({enabled: true})
       true
-    else
-      response = Response.new
-      @request_channel.send(EnableToolRequest.new(name, true, response))
-      response.join
-      !response.error?
     end
   end
 
@@ -120,32 +125,31 @@ class Agent
   # Returns `false` if no tool with that name is registered.
   # Safe to call from any fiber.
   def disable_tool(name : String) : Bool
-    raise ClosedError.new if @closed
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
 
-    if Fiber.current == @fiber
+    @tools_mutex.synchronize do
       return false unless @registered_tools.has_key?(name)
       @registered_tools[name] = @registered_tools[name].merge({enabled: false})
       true
-    else
-      response = Response.new
-      @request_channel.send(EnableToolRequest.new(name, false, response))
-      response.join
-      !response.error?
     end
   end
 
   # Returns the names of all currently enabled tools.
+  # Thread-safe; acquires @tools_mutex internally.
   def enabled_tools : Array(String)
-    @registered_tools.select { |_, v| v[:enabled] }.keys
+    @tools_mutex.synchronize { @registered_tools.select { |_, v| v[:enabled] }.keys }
   end
 
   # Close the agent, shutting down the background fiber.
   # Any pending or future #ask calls will get a closed-error response.
   # Safe to call multiple times.
+  #
+  # NOTE: Do not call #close from inside a tool callback — if you need
+  # to stop the agent mid-callback, prefer response.cancel on the
+  # current Response. Calling #close from a tool callback will close
+  # the HTTP client underneath the in-flight request.
   def close : Nil
-    return if @closed
-
-    @closed = true
+    @state_mutex.synchronize { return if @closed; @closed = true }
     @request_channel.close
     @http_client.close
     @provider.close
@@ -170,7 +174,7 @@ class Agent
   #
   # Raises Agent::ClosedError if the agent has been closed via #close.
   def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil) : Response
-    raise ClosedError.new if @closed
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
 
     msg = if atts = attachments
             parts = [ContentPart.new(type: :text, text: content)] + atts.map { |path| ContentPart.from_path(path) }
@@ -191,7 +195,7 @@ class Agent
   #
   # Raises Agent::ClosedError if the agent has been closed via #close.
   def ask(tool_results : Array(Message), tools : Array(Tool)? = nil) : Response
-    raise ClosedError.new if @closed
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
 
     response = Response.new
     @request_channel.send(AskRequest.new(tool_results, tools, response))
@@ -201,16 +205,14 @@ class Agent
   end
 
   # Reset the conversation history back to the system prompt only.
-  # Waits for any in-flight request to complete before clearing history.
+  #
+  # NOTE: Calling #reset while an #ask is in-flight is undefined behavior.
+  # Wait for any in-flight Response to complete (via #join) first.
+  #
   # Raises Agent::ClosedError if the agent has been closed.
   def reset : Nil
-    raise ClosedError.new if @closed
-
-    response = Response.new
-    @request_channel.send(ResetRequest.new(response))
-    response.join
-  rescue Channel::ClosedError
-    raise ClosedError.new
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
+    @history_mutex.synchronize { @history.clear }
   end
 
   # Restore the full conversation history.
@@ -218,22 +220,22 @@ class Agent
   # previous `#dump`). The system prompt is NOT included — `build_messages`
   # prepends it from Config as usual.
   #
-  # Safe to call after a previous #ask has completed. Waits for the fiber to
-  # acknowledge the replacement before returning.
+  # NOTE: Calling #load_history while an #ask is in-flight is undefined behavior.
+  # Wait for any in-flight Response to complete (via #join) first.
   #
   # Raises Agent::ClosedError if the agent has been closed.
   def load_history(messages : Array(Message)) : Nil
-    raise ClosedError.new if @closed
-
-    response = Response.new
-    @request_channel.send(LoadHistoryRequest.new(messages, response))
-    response.join
-  rescue Channel::ClosedError
-    raise ClosedError.new
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
+    @history_mutex.synchronize do
+      @history.clear
+      @history.concat(messages)
+    end
   end
 
   # Serialise the current session fields into an open JSON object.
   # Call this inside a `json.object` block managed by the caller.
+  #
+  # Thread-safe; acquires @history_mutex and @tools_mutex internally.
   #
   # ```
   # JSON.build do |json|
@@ -244,17 +246,19 @@ class Agent
   # end
   # ```
   def dump(json : JSON::Builder) : Nil
+    result = snapshot_session
+
     json.field "version", 1
-    json.field "session_id", @session_id
-    json.field "cache_key", @cache_key
-    json.field "history", @history
+    json.field "session_id", result.session_id
+    json.field "cache_key", result.cache_key
+    json.field "history", result.history
 
     # Persist only the names of enabled tools.
     # The actual tool definitions (with callbacks) are application code
     # and must be re-registered before load.
-    enabled_names = enabled_tools
-    unless enabled_names.empty?
-      json.field "enabled_tools", enabled_names
+    tools = result.enabled_tools
+    unless tools.empty?
+      json.field "enabled_tools", tools
     end
   end
 
@@ -272,6 +276,26 @@ class Agent
       end
     end
   end
+
+  # Internal: fetch session snapshot with mutex protection.
+  # Replaces the earlier channel-based DumpRequest round-trip.
+  private def snapshot_session : DumpResult
+    history_dup = @history_mutex.synchronize { @history.dup }
+    enabled_names = @tools_mutex.synchronize { @registered_tools.select { |_, v| v[:enabled] }.keys }
+    DumpResult.new(
+      session_id: @session_id,
+      cache_key: @cache_key,
+      history: history_dup,
+      enabled_tools: enabled_names,
+    )
+  end
+
+  # Result carrier for session snapshot.
+  private record DumpResult,
+    session_id : String,
+    cache_key : String,
+    history : Array(Message),
+    enabled_tools : Array(String)
 
   # Restore an Agent from previously dumped session data.
   #
@@ -305,12 +329,14 @@ class Agent
 
     # Restore enabled-tool names. Tools must have been re-registered
     # (with callbacks) before load for this to have any effect.
-    enabled_names.each do |name|
-      if agent.@registered_tools.has_key?(name)
-        entry = agent.@registered_tools[name]
-        agent.@registered_tools[name] = entry.merge({enabled: true})
-      else
-        Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
+    agent.@tools_mutex.synchronize do
+      enabled_names.each do |name|
+        if agent.@registered_tools.has_key?(name)
+          entry = agent.@registered_tools[name]
+          agent.@registered_tools[name] = entry.merge({enabled: true})
+        else
+          Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
+        end
       end
     end
 
@@ -379,14 +405,14 @@ class Agent
   # Internal
   # ---------------------------------------------------------------------------
 
-  private def build_messages(msgs_to_append : Array(Message)) : Array(Message)
+  private def build_messages(history : Array(Message), msgs_to_append : Array(Message)) : Array(Message)
     msgs = [] of Message
 
     if (sys = @config.system_prompt) && !sys.empty?
       msgs << Message.new(role: Role::System, content: sys)
     end
 
-    msgs.concat(@history)
+    msgs.concat(history)
     msgs.concat(msgs_to_append)
     msgs
   end
@@ -394,43 +420,7 @@ class Agent
   private def run_loop : Nil
     loop do
       request = @request_channel.receive
-
       case request
-      in ResetRequest
-        # Reset request — clear history and signal completion.
-        @history.clear
-        request.response.finish(
-          Message.new(role: Role::Assistant, content: "History cleared."),
-          Usage.new,
-        )
-      in RegisterToolRequest
-        # Register a tool from another fiber.
-        @registered_tools[request.name] = {tool: request.tool, callback: request.callback, enabled: request.enabled}
-        request.response.finish(
-          Message.new(role: Role::Assistant, content: "Tool '#{request.name}' registered."),
-          Usage.new,
-        )
-      in EnableToolRequest
-        # Enable or disable a tool from another fiber.
-        if entry = @registered_tools[request.name]?
-          @registered_tools[request.name] = entry.merge({enabled: request.enabled})
-          request.response.finish(
-            Message.new(role: Role::Assistant, content: "Tool '#{request.name}' #{request.enabled ? "enabled" : "disabled"}."),
-            Usage.new,
-          )
-        else
-          request.response.finish_with_error(
-            Agent::Error.new("No registered tool named '#{request.name}'")
-          )
-        end
-      in LoadHistoryRequest
-        # Restore history from a saved session.
-        @history.clear
-        @history.concat(request.messages)
-        request.response.finish(
-          Message.new(role: Role::Assistant, content: "History restored (#{request.messages.size} messages)."),
-          Usage.new,
-        )
       in AskRequest
         process_request_loop(request)
       end
@@ -444,19 +434,31 @@ class Agent
   # When the model returns tool calls and auto_execute_tools is enabled,
   # registered tools are executed inline and the result is sent back to the
   # model — all within this fiber, without returning to the caller.
+  #
+  # Access to @history and @registered_tools is synchronized via
+  # @history_mutex and @tools_mutex. The HTTP call happens outside the locks.
   private def process_request_loop(request : AskRequest) : Nil
     response = request.response
     tools = request.tools
     max_iter = @config.max_tool_iterations
     iteration = 0
 
-    # Append new messages to history and build the request body.
-    # By appending on the fiber, we avoid concurrent mutations from caller fibers.
-    @history.concat(request.new_messages)
-    messages = build_messages([] of Message)
+    # Append new messages to history under the lock, then snapshot for the HTTP call.
+    history_snapshot = @history_mutex.synchronize do
+      @history.concat(request.new_messages)
+      @history.dup
+    end
+    messages = build_messages(history_snapshot, [] of Message)
 
     loop do
       iteration += 1
+
+      # If the agent was closed during tool execution, bail out.
+      if @state_mutex.synchronize { @closed }
+        err = Agent::Error.new("Agent was closed")
+        response.finish_with_error(err)
+        break
+      end
 
       # If the caller cancelled during tool execution, bail out.
       if response.cancelled?
@@ -479,18 +481,21 @@ class Agent
       # Roll back the user messages that were appended at the start of this
       # request so history is not corrupted for subsequent #ask calls.
       if response.error?
-        request.new_messages.each { @history.pop }
+        @history_mutex.synchronize do
+          request.new_messages.each { @history.pop }
+        end
         break
       end
 
-      # Append the assistant message to history. We need this here for the
-      # auto-resolve loop (tool results follow this message) and also for the
-      # manual-dispatch path (the caller calls #ask(tool_results) next, which
-      # requires the assistant(tool_calls) to precede the tool messages).
-      @history << msg
+      # Append the assistant message to history under the lock.
+      @history_mutex.synchronize { @history << msg }
+
+      # Determine whether to auto-resolve tools.
+      # Read @registered_tools under the lock.
+      has_registered_tools = @tools_mutex.synchronize { !@registered_tools.empty? }
 
       # If no tool calls, or auto_execute is disabled, or no registered tools — done.
-      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || @registered_tools.empty?
+      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || !has_registered_tools
       if no_tools
         trim_history!
         response.finish(msg, usage, finish_reason: finish_reason)
@@ -511,9 +516,10 @@ class Agent
         break
       end
 
-      # Append tool results to history, then rebuild messages for next iteration.
-      @history.concat(results)
-      messages = build_messages([] of Message)
+      # Append tool results to history under the lock, then rebuild messages for next iteration.
+      @history_mutex.synchronize { @history.concat(results) }
+      history_snapshot = @history_mutex.synchronize { @history.dup }
+      messages = build_messages(history_snapshot, [] of Message)
     end
   end
 
@@ -533,45 +539,43 @@ class Agent
       # Walk forward to find how many messages to drop so that at most
       # max*2 user+assistant messages remain. We track the index of the
       # last message that would be dropped.
-      keep = max * 2
-      dropped = 0
-      @history.each_with_index do |m, i|
-        break if keep <= 0
+      drop_count = 0
+      keep_count = msg_count - max * 2
+      kept = 0
+
+      @history.each_with_index do |m, idx|
+        if kept >= keep_count
+          # We've found the first complete turn to keep.
+          # Drop everything up to (but not including) here.
+          drop_count = idx
+          break
+        end
+
         if m.role == Role::User || m.role == Role::Assistant
-          keep -= 1
-          dropped = i + 1
+          kept += 1
         end
       end
 
-      # Never split a tool-call group: if the cut point lands in the
-      # middle of an assistant(tool_calls)+tool-results sequence, advance
-      # to the next safe boundary.
-      if dropped < @history.size
-        dropped = find_turn_boundary(@history, dropped)
+      # If we found a boundary, drop from the front.
+      if drop_count > 0
+        @history = @history[drop_count..]
       end
-
-      @history.shift(dropped) if dropped > 0
     end
   end
 
-  # Find the earliest index >= start that is a valid turn boundary.
-  # A valid boundary is a User message (starts new turn), or one past
-  # an Assistant message without tool_calls (ends the previous turn).
-  private def find_turn_boundary(history : Array(Message), start : Int32) : Int32
-    idx = start
-    while idx < history.size
-      m = history[idx]
-      return idx if m.role == Role::User
-      if m.role == Role::Assistant && !m.has_tool_calls?
-        return idx + 1
-      end
-      idx += 1
+  # Walk backwards from the given index (exclusive) to find the index of the
+  # preceding user message, ensuring we don't split a turn.
+  private def find_turn_boundary(start_idx : Int32) : Int32
+    idx = start_idx - 2
+    while idx >= 0
+      return idx if @history[idx].role == Role::User
+      idx -= 1
     end
-    history.size
+    0
   end
 
-  # Execute registered tool callbacks for the given tool calls.
-  # Returns an array of tool result Messages, or an empty array if any
+  # Execute all tool calls that have registered callbacks.
+  # Returns the array of tool-result messages. Returns an **empty** array if any
   # tool call has no registered handler.
   # If a callback raises, the error is caught and returned as a tool-result
   # message with an error description, so the agent fiber never dies.
@@ -579,7 +583,7 @@ class Agent
     results = [] of Message
 
     tool_calls.each do |tc|
-      entry = @registered_tools[tc.name]?
+      entry = @tools_mutex.synchronize { @registered_tools[tc.name]? }
       if entry.nil? || !entry[:enabled]
         return [] of Message
       end
@@ -644,58 +648,70 @@ class Agent
     # Check required fields are present.
     required.each do |field|
       unless args.has_key?(field)
-        errors << "missing required field '#{field}'"
+        errors << "Missing required field '#{field}'"
       end
     end
 
-    # Type-check provided fields against the schema.
+    # Check that all provided arguments have known types.
     args.each do |key, value|
-      prop = props[key]?.try(&.as_h?)
-      next if prop.nil?
-
-      expected_type = prop["type"]?.try(&.as_s?)
-      next if expected_type.nil? || value.raw.nil?
-
-      unless type_matches?(value.raw, expected_type)
-        errors << "field '#{key}' expected #{expected_type}, got #{type_name(value.raw)}"
+      if prop = props[key]?
+        if type_name = type_name(value)
+          expected = prop["type"]?.try(&.as_s)
+          if expected && !type_matches?(type_name, expected)
+            errors << "Field '#{key}' expected type '#{expected}', got '#{type_name}'"
+          end
+        end
       end
     end
 
     errors
   end
 
-  # Check if a JSON::Any raw value matches a JSON Schema type name.
-  private def type_matches?(raw : JSON::Any::Type?, expected_type : String) : Bool
-    case raw
-    when String  then expected_type == "string"
-    when Int64   then expected_type == "integer" || expected_type == "number"
-    when Float64 then expected_type == "number"
-    when Bool    then expected_type == "boolean"
-    when Array   then expected_type == "array"
-    when Hash    then expected_type == "object"
-    when Nil     then true # null can be anything
-    else              false
+  private def type_matches?(actual_type : String, expected_type : String) : Bool
+    case expected_type
+    when "integer"
+      actual_type == "integer" || actual_type == "number"
+    when "number"
+      actual_type == "integer" || actual_type == "number"
+    when "array"
+      actual_type == "array"
+    when "object"
+      actual_type == "object"
+    when "string"
+      actual_type == "string"
+    when "boolean"
+      actual_type == "boolean"
+    else
+      true
     end
   end
 
-  # Human-readable type name for a JSON::Any raw value.
-  private def type_name(raw : JSON::Any::Type?) : String
-    case raw
-    when String  then "string"
-    when Int64   then "integer"
-    when Float64 then "number"
-    when Bool    then "boolean"
-    when Array   then "array"
-    when Hash    then "object"
-    when Nil     then "null"
-    else              raw.class.to_s
+  # Return the JSON type name of a JSON::Any value.
+  private def type_name(value : JSON::Any) : String?
+    case value.raw
+    when String
+      "string"
+    when Int64, Int32, Int16, Int8
+      "number"
+    when Float64, Float32
+      "number"
+    when Bool
+      "boolean"
+    when Array
+      "array"
+    when Hash
+      "object"
+    when Nil
+      nil
+    else
+      nil
     end
   end
 
   # Returns the combined tool list: per-request tools merged with registered tools.
   # Registered tools take precedence over per-request tools with the same name.
   private def combined_tools(tools : Array(Tool)?) : Array(Tool)?
-    enabled_reg = @registered_tools.select { |_, v| v[:enabled] }
+    enabled_reg = @tools_mutex.synchronize { @registered_tools.select { |_, v| v[:enabled] } }
 
     if enabled_reg.empty?
       tools

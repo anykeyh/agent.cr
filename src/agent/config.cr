@@ -70,6 +70,8 @@ class Agent
       end
     end
 
+    # NOTE: max_history: 0 and nil both mean "no limit" (never trim).
+
     private def validate_max_tool_iterations(mti : Int32?) : Nil
       if mti && mti < 1
         raise ArgumentError.new("max_tool_iterations must be >= 1, got #{mti}")
@@ -85,9 +87,12 @@ class Agent
     end
 
     # The chat completions path derived from api_endpoint.
+    # Normalises duplicate slashes in the endpoint path.
     def chat_path : String
       base_path = @parsed_uri.path.empty? || @parsed_uri.path == "/" ? "" : @parsed_uri.path.rstrip('/')
-      "#{base_path}/chat/completions"
+      # Normalize duplicate slashes (e.g. "//v1" -> "/v1")
+      normalized = base_path.gsub(/\/+/, "/")
+      "#{normalized}/chat/completions"
     end
   end
 end

@@ -1,7 +1,17 @@
+require "sync"
+
 class Agent
   # A handle on the pending response from #ask.
   # Wraps the ongoing fiber-based HTTP streaming and provides
   # streaming chunks, final message, metadata, and wait/join operations.
+  #
+  # Synchronization:
+  #   - `chunk_channel` (size 256): legitimate stream queue with backpressure.
+  #   - `message_channel` (size 1) and `usage_channel` (size 1): legitimate
+  #     one-shot futures for the final message and usage metadata.
+  #   - Shared flags (@done, @cancelled, @streaming, @finish_reason, @error)
+  #     are protected by a Mutex. The old `cancel_channel` (unconsumed) has
+  #     been removed in favor of a mutex-protected bool.
   class Response
     CHUNK_BUFFER = 256
 
@@ -46,22 +56,26 @@ class Agent
     private getter message_channel : Channel(Message)
     # Signals the final Usage metadata.
     private getter usage_channel : Channel(Usage)
-    # Signals cancellation to the processing fiber.
-    private getter cancel_channel : Channel(Nil)
 
-    @message : Message?
-    @metadata : Usage?
+    # --- mutex-protected shared state ---
+
+    @mutex : Sync::Mutex
     @done = false
     @cancelled = false
     @streaming = false
     @finish_reason : String?
     @error : Agent::Error?
 
+    # Cached values so the second call to #message / #metadata
+    # does not block on the channel again.
+    @message : Message?
+    @metadata : Usage?
+
     def initialize
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
       @message_channel = Channel(Message).new(1)
       @usage_channel = Channel(Usage).new(1)
-      @cancel_channel = Channel(Nil).new(1)
+      @mutex = Sync::Mutex.new
     end
 
     # Request cancellation of this in-flight response.
@@ -70,50 +84,53 @@ class Agent
     # After cancellation, #message returns a "Agent error: cancelled" message
     # and #error returns a CancelledError.
     def cancel : Nil
-      return if @done || @cancelled
-
-      @cancelled = true
-      @cancel_channel.send(nil)
-    rescue Channel::ClosedError
-      # already finished
+      @mutex.synchronize { @cancelled = true }
     end
 
     # Returns true if cancel was requested.
     def cancelled? : Bool
-      @cancelled
+      @mutex.synchronize { @cancelled }
     end
 
     # Returns true when the response has finished assembling.
     def finished? : Bool
-      @done
+      @mutex.synchronize { @done }
     end
 
     # The reason the stream finished ("stop", "length", "tool_calls", etc.)
     # or nil if not known / the request errored.
     def finish_reason : String?
-      @finish_reason
+      @mutex.synchronize { @finish_reason }
     end
 
     # Returns the error if this response represents a failed request, or nil.
     def error : Agent::Error?
-      @error
+      @mutex.synchronize { @error }
     end
 
     # Returns true if this response represents a failed request.
     def error? : Bool
-      !@error.nil?
+      @mutex.synchronize { !@error.nil? }
     end
 
     # Return the fully assembled message (blocks until ready).
     def message : Message
-      @message ||= @message_channel.receive
+      @message ||= begin
+        msg = @message_channel.receive
+        @mutex.synchronize { @message = msg }
+        msg
+      end
     rescue Channel::ClosedError
       @message || raise("BUG: message channel closed without delivering a message")
     end
 
     # Return the metadata / usage (blocks until ready).
     def metadata : Usage
-      @metadata ||= @usage_channel.receive
+      @metadata ||= begin
+        meta = @usage_channel.receive
+        @mutex.synchronize { @metadata = meta }
+        meta
+      end
     rescue Channel::ClosedError
       @metadata || Usage.new
     end
@@ -127,7 +144,7 @@ class Agent
     # Yields each chunk as it arrives from the API.
     # Use `chunk.text` for the string and `chunk.kind` for its origin.
     def stream(& : Chunk -> _) : Nil
-      @streaming = true
+      @mutex.synchronize { @streaming = true }
       loop do
         chunk = @chunk_channel.receive
         yield chunk
@@ -137,11 +154,18 @@ class Agent
     end
 
     # Internal: push a chunk (safe to call from any fiber).
-    # Uses a buffered channel to avoid blocking when nobody is consuming
-    # via #stream (e.g. caller uses #message directly).
-    # If the buffer is full, spawns a fiber so the HTTP processing doesn't
-    # deadlock — the chunk will be delivered as soon as space frees up.
+    # Uses a buffered channel with capacity 256.
+    #
+    # When nobody is consuming via #stream, chunks are discarded entirely
+    # — the final message is assembled from SSE deltas regardless, so
+    # dropping character-level chunks does not affect correctness.
+    # This prevents deadlocks when the model emits long tool-call
+    # argument strings and the caller uses #message directly.
+    #
+    # When #stream is active, blocks until the consumer reads.
     def push_chunk(chunk : Chunk) : Nil
+      return unless @mutex.synchronize { @streaming }
+
       @chunk_channel.send(chunk)
     rescue Channel::ClosedError
       # already finished
@@ -150,10 +174,13 @@ class Agent
     # Internal: signal that the response is complete.
     # Safe to call multiple times — subsequent calls are no-ops.
     def finish(message : Message, usage : Usage, finish_reason : String? = nil) : Nil
-      return if @done
-
-      @done = true
-      @finish_reason = finish_reason
+      @mutex.synchronize do
+        return if @done
+        @done = true
+        @finish_reason = finish_reason
+        @message = message
+        @metadata = usage
+      end
       @message_channel.send(message)
       @usage_channel.send(usage)
     ensure
@@ -164,11 +191,15 @@ class Agent
     # Stores the error and sends an error message through the normal channels
     # so consumers can still call #message.
     def finish_with_error(err : Agent::Error) : Nil
-      return if @done
-
-      @done = true
-      @error = err
       error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
+
+      @mutex.synchronize do
+        return if @done
+        @done = true
+        @error = err
+        @message = error_msg
+        @metadata = Usage.new
+      end
       @message_channel.send(error_msg)
       @usage_channel.send(Usage.new)
     ensure
