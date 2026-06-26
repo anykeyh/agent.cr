@@ -118,18 +118,28 @@ class Agent
     private def self.from_remote_url(path : String) : self
       mime = mime_type_from_extension(path)
       type = mime.starts_with?("image/") ? PartType::ImageUrl : PartType::File
-      new(type: type, url: path, mime_type: mime, filename: File.basename(URI.parse(path).path || ""))
+      filename = begin
+        File.basename(URI.parse(path).path || "")
+      rescue
+        File.basename(path.split("?").first)
+      end
+      new(type: type, url: path, mime_type: mime, filename: filename)
     end
 
     # Build a ContentPart from a data URI.
     private def self.from_data_uri(path : String) : self
       mime = path[5..].split(";").first?
       mime = "application/octet-stream" if mime.nil? || mime.empty?
+      # Reject non-base64 data URIs — the provider API won't accept raw data.
+      unless path.includes?(";base64,")
+        raise ArgumentError.new("Data URI must use base64 encoding (;base64,) — got: #{path[0..50]}")
+      end
       type = mime.starts_with?("image/") ? PartType::ImageUrl : PartType::File
       new(type: type, url: path, mime_type: mime)
     end
 
     # Build a ContentPart from a local file path, reading & encoding as needed.
+    # Raises ArgumentError if the file does not exist or exceeds the size limit.
     private def self.from_local_file(path : String) : self
       bytes = read_file_bytes(path)
       mime = mime_type_from_extension(path)
@@ -196,13 +206,25 @@ class Agent
 
     # --- helpers ---
 
+    # Default maximum attachment size (25 MB, matching OpenAI's limit).
+    MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024
+
     def self.read_file_bytes(path : String) : Bytes
+      raise ArgumentError.new("File not found: #{path}") unless File.exists?(path)
+
       File.open(path, "rb") do |f|
         size = f.size
+        if size > MAX_ATTACHMENT_SIZE
+          raise ArgumentError.new("Attachment too large: #{size} bytes (max #{MAX_ATTACHMENT_SIZE})")
+        end
         slice = Slice(UInt8).new(size)
         f.read_fully(slice)
         slice
       end
+    rescue e : ArgumentError
+      raise e
+    rescue e : File::Error
+      raise ArgumentError.new("Cannot read attachment: #{path}")
     end
 
     # Map a file extension to a MIME type.
@@ -236,7 +258,7 @@ class Agent
       ".md"       => "text/markdown",
       ".markdown" => "text/markdown",
       ".txt"      => "text/plain",
-      ".rb"       => "text/x-crystal",
+      ".rb"       => "text/x-ruby",
       ".cr"       => "text/x-crystal",
       ".py"       => "text/x-python",
       ".js"       => "text/javascript",
@@ -251,6 +273,7 @@ class Agent
     end
 
     # Map a MIME type to an OpenAI audio format string.
+    # Raises ArgumentError for unsupported audio MIME types.
     def self.audio_format_from_mime(mime : String) : String
       case mime
       when "audio/mpeg" then "mp3"
@@ -259,7 +282,7 @@ class Agent
       when "audio/flac" then "flac"
       when "audio/aac"  then "aac"
       when "audio/opus" then "opus"
-      else                   "wav"
+      else                   raise ArgumentError.new("Unsupported audio format: #{mime}")
       end
     end
   end

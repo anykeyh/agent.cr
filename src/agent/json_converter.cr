@@ -39,11 +39,20 @@ class Agent
         JSON::Any.new(h)
       when Array
         JSON::Any.new(value.map { |v| convert(v) })
+      else
+        convert_scalar(value)
+      end
+    end
+
+    private def convert_scalar(value) : JSON::Any
+      case value
       when String  then JSON::Any.new(value)
       when Bool    then JSON::Any.new(value)
       when Int     then JSON::Any.new(value.to_i64)
       when Float64 then JSON::Any.new(value)
       when Float32 then JSON::Any.new(value.to_f64)
+      when Symbol  then JSON::Any.new(value.to_s)
+      when Enum    then JSON::Any.new(value.to_s)
       when Nil     then JSON::Any.new(value)
       else
         raise ArgumentError.new("JSONConverter cannot handle #{value.class}: #{value.inspect}")

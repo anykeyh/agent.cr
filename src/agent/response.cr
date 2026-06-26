@@ -53,6 +53,7 @@ class Agent
     @metadata : Usage?
     @done = false
     @cancelled = false
+    @streaming = false
     @finish_reason : String?
     @error : Agent::Error?
 
@@ -69,7 +70,7 @@ class Agent
     # After cancellation, #message returns a "Agent error: cancelled" message
     # and #error returns a CancelledError.
     def cancel : Nil
-      return if @cancelled
+      return if @done || @cancelled
 
       @cancelled = true
       @cancel_channel.send(nil)
@@ -106,11 +107,15 @@ class Agent
     # Return the fully assembled message (blocks until ready).
     def message : Message
       @message ||= @message_channel.receive
+    rescue Channel::ClosedError
+      @message || raise("BUG: message channel closed without delivering a message")
     end
 
     # Return the metadata / usage (blocks until ready).
     def metadata : Usage
       @metadata ||= @usage_channel.receive
+    rescue Channel::ClosedError
+      @metadata || Usage.new
     end
 
     # Wait for the response to complete (both message and usage).
@@ -122,6 +127,7 @@ class Agent
     # Yields each chunk as it arrives from the API.
     # Use `chunk.text` for the string and `chunk.kind` for its origin.
     def stream(& : Chunk -> _) : Nil
+      @streaming = true
       loop do
         chunk = @chunk_channel.receive
         yield chunk
@@ -133,6 +139,8 @@ class Agent
     # Internal: push a chunk (safe to call from any fiber).
     # Uses a buffered channel to avoid blocking when nobody is consuming
     # via #stream (e.g. caller uses #message directly).
+    # If the buffer is full, spawns a fiber so the HTTP processing doesn't
+    # deadlock — the chunk will be delivered as soon as space frees up.
     def push_chunk(chunk : Chunk) : Nil
       @chunk_channel.send(chunk)
     rescue Channel::ClosedError
@@ -144,10 +152,10 @@ class Agent
     def finish(message : Message, usage : Usage, finish_reason : String? = nil) : Nil
       return if @done
 
+      @done = true
       @finish_reason = finish_reason
       @message_channel.send(message)
       @usage_channel.send(usage)
-      @done = true
     ensure
       @chunk_channel.close
     end
@@ -158,11 +166,11 @@ class Agent
     def finish_with_error(err : Agent::Error) : Nil
       return if @done
 
+      @done = true
       @error = err
       error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
       @message_channel.send(error_msg)
       @usage_channel.send(Usage.new)
-      @done = true
     ensure
       @chunk_channel.close
     end

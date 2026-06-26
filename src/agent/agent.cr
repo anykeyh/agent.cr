@@ -16,7 +16,8 @@ class Agent
     name : String,
     tool : Tool,
     callback : (Hash(String, JSON::Any) -> String)?,
-    enabled : Bool
+    enabled : Bool,
+    response : Response
   private record EnableToolRequest, name : String, enabled : Bool, response : Response
   private record LoadHistoryRequest, messages : Array(Message), response : Response
 
@@ -91,7 +92,9 @@ class Agent
       @registered_tools[name] = entry
     else
       # From another fiber — route through the request channel for ordering.
-      @request_channel.send(RegisterToolRequest.new(name, tool, block, enabled))
+      response = Response.new
+      @request_channel.send(RegisterToolRequest.new(name, tool, block, enabled, response))
+      response.join
     end
   end
 
@@ -109,7 +112,7 @@ class Agent
       response = Response.new
       @request_channel.send(EnableToolRequest.new(name, true, response))
       response.join
-      true
+      !response.error?
     end
   end
 
@@ -127,7 +130,7 @@ class Agent
       response = Response.new
       @request_channel.send(EnableToolRequest.new(name, false, response))
       response.join
-      true
+      !response.error?
     end
   end
 
@@ -318,46 +321,58 @@ class Agent
   # All parsing occurs here, before the agent fiber is spawned, so any
   # corruption raises a `SessionLoadError` without leaking resources.
   private def self.extract_session_data(data : String | JSON::Any) : {String, String, Array(Message), Array(String)}
-    parsed = begin
-      h = data.is_a?(String) ? JSON.parse(data) : data
-      h.as_h
-    rescue ex
-      raise SessionLoadError.new("not a valid JSON object", cause: ex)
-    end
+    parsed = parse_session_root(data)
+    {
+      parse_session_id(parsed),
+      parse_cache_key(parsed),
+      parse_history(parsed),
+      parse_enabled_tools(parsed),
+    }
+  end
 
-    session_id = begin
+  private def self.parse_session_root(data : String | JSON::Any) : Hash(String, JSON::Any)
+    h = data.is_a?(String) ? JSON.parse(data) : data
+    h.as_h
+  rescue ex
+    raise SessionLoadError.new("not a valid JSON object", cause: ex)
+  end
+
+  private def self.parse_session_id(parsed : Hash(String, JSON::Any)) : String
+    id = begin
       parsed["session_id"]?.try(&.as_s)
     rescue ex
       raise SessionLoadError.new("'session_id' field missing or not a string", cause: ex)
     end
-    raise SessionLoadError.new("'session_id' field missing or not a string") if session_id.nil?
+    raise SessionLoadError.new("'session_id' field missing or not a string") if id.nil?
+    id
+  end
 
-    cache_key = begin
+  private def self.parse_cache_key(parsed : Hash(String, JSON::Any)) : String
+    key = begin
       parsed["cache_key"]?.try(&.as_s)
     rescue ex
       raise SessionLoadError.new("'cache_key' field missing or not a string", cause: ex)
     end
-    raise SessionLoadError.new("'cache_key' field missing or not a string") if cache_key.nil?
+    raise SessionLoadError.new("'cache_key' field missing or not a string") if key.nil?
+    key
+  end
 
-    history = begin
-      history_raw = parsed["history"]?
-      raise SessionLoadError.new("'history' field missing") if history_raw.nil?
-      Array(Message).from_json(history_raw.to_json)
-    rescue ex
-      raise SessionLoadError.new("'history' field is malformed", cause: ex)
+  private def self.parse_history(parsed : Hash(String, JSON::Any)) : Array(Message)
+    history_raw = parsed["history"]?
+    raise SessionLoadError.new("'history' field missing") if history_raw.nil?
+    Array(Message).from_json(history_raw.to_json)
+  rescue ex
+    raise SessionLoadError.new("'history' field is malformed", cause: ex)
+  end
+
+  private def self.parse_enabled_tools(parsed : Hash(String, JSON::Any)) : Array(String)
+    if data = parsed["enabled_tools"]?
+      data.as_a.map(&.as_s)
+    else
+      [] of String
     end
-
-    enabled_names = begin
-      if (data = parsed["enabled_tools"]?)
-        data.as_a.map(&.as_s)
-      else
-        [] of String
-      end
-    rescue ex
-      raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
-    end
-
-    {session_id, cache_key, history, enabled_names}
+  rescue ex
+    raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
   end
 
   # ---------------------------------------------------------------------------
@@ -391,6 +406,10 @@ class Agent
       in RegisterToolRequest
         # Register a tool from another fiber.
         @registered_tools[request.name] = {tool: request.tool, callback: request.callback, enabled: request.enabled}
+        request.response.finish(
+          Message.new(role: Role::Assistant, content: "Tool '#{request.name}' registered."),
+          Usage.new,
+        )
       in EnableToolRequest
         # Enable or disable a tool from another fiber.
         if entry = @registered_tools[request.name]?
@@ -439,6 +458,13 @@ class Agent
     loop do
       iteration += 1
 
+      # If the caller cancelled during tool execution, bail out.
+      if response.cancelled?
+        err = CancelledError.new
+        response.finish_with_error(err)
+        break
+      end
+
       # Bail out if the model is stuck in a tool-call loop.
       if max_iter && iteration > max_iter
         err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
@@ -450,9 +476,10 @@ class Agent
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
       # On error, http_post_stream already called response.finish/finish_with_error.
-      # Append the synthetic error message to keep history well-formed.
+      # Roll back the user messages that were appended at the start of this
+      # request so history is not corrupted for subsequent #ask calls.
       if response.error?
-        @history << msg
+        request.new_messages.each { @history.pop }
         break
       end
 
@@ -586,14 +613,14 @@ class Agent
       end
 
       result = if cb = entry[:callback]
-                begin
-                  cb.call(args_hash)
-                rescue ex
-                  "Error executing tool '#{tc.name}': #{ex.message}"
-                end
-              else
-                "Error executing tool '#{tc.name}': no callback registered"
-              end
+                 begin
+                   cb.call(args_hash)
+                 rescue ex
+                   "Error executing tool '#{tc.name}': #{ex.message}"
+                 end
+               else
+                 "Error executing tool '#{tc.name}': no callback registered"
+               end
 
       results << Message.new(
         role: Role::Tool,

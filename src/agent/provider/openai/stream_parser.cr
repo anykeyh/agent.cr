@@ -38,15 +38,14 @@ class Agent
 
             line = line.strip
             next if line.empty?
-            next if line == "data: [DONE]"
             next unless line.starts_with?("data:")
 
-            # Extract JSON after "data:" (possibly with or without trailing space, per SSE spec)
-            json_data = line[5..]
-            json_data = json_data.lstrip(' ')
+            # SSE sentinel — skip [DONE] (with or without space after data:)
+            rest = line[5..].lstrip(' ')
+            next if rest.starts_with?("[DONE]")
 
             json = begin
-              JSON.parse(json_data)
+              JSON.parse(rest)
             rescue JSON::ParseException
               next
             end
@@ -122,29 +121,43 @@ class Agent
           response : Response,
         ) : Nil
           tc_delta = delta["tool_calls"]?.try(&.as_a?) || return
-          tc_delta.each do |tcd|
-            idx = tcd["index"]?.try(&.as_i) || 0
+          tc_delta.each_with_index do |tcd_any, pos|
+            tcd = tcd_any.as_h? || next
+            # Use the API-provided index if present, otherwise fall back to
+            # positional order (handles providers that omit the index field).
+            idx = tcd["index"]?.try(&.as_i) || pos
 
             entry = tool_call_deltas[idx] ||= ToolCallDelta.new
+            update_tool_call_id(entry, tcd)
+            update_tool_call_function(entry, tcd, response)
+          end
+        end
 
-            if id = tcd["id"]?
-              entry.id = id.as_s
+        private def update_tool_call_id(entry : ToolCallDelta, tcd : Hash(String, JSON::Any)) : Nil
+          if id = tcd["id"]?
+            if id_s = id.as_s?
+              entry.id = id_s
             end
+          end
+        end
 
-            if fn = tcd["function"]?
-              fn_h = fn.as_h
-              if fn_h_name = fn_h["name"]?
-                name_str = fn_h_name.as_s
-                # Only push the name chunk once — subsequent deltas may re-send the name.
-                if entry.name.empty?
-                  response.push_chunk(Response::Chunk.new(name_str, Response::ChunkKind::ToolCallName))
-                end
-                entry.name = name_str
+        private def update_tool_call_function(entry : ToolCallDelta, tcd : Hash(String, JSON::Any), response : Response) : Nil
+          fn = tcd["function"]? || return
+          fn_h = fn.as_h? || return
+
+          if fn_h_name = fn_h["name"]?
+            if name_str = fn_h_name.as_s?
+              if entry.name.empty?
+                response.push_chunk(Response::Chunk.new(name_str, Response::ChunkKind::ToolCallName))
               end
-              if fn_h_args = fn_h["arguments"]?
-                entry.arguments += fn_h_args.as_s
-                response.push_chunk(Response::Chunk.new(fn_h_args.as_s, Response::ChunkKind::ToolCallArgs))
-              end
+              entry.name = name_str
+            end
+          end
+
+          if fn_h_args = fn_h["arguments"]?
+            if args_str = fn_h_args.as_s?
+              entry.arguments += args_str
+              response.push_chunk(Response::Chunk.new(args_str, Response::ChunkKind::ToolCallArgs))
             end
           end
         end
