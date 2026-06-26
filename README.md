@@ -26,7 +26,7 @@ shards install
 
 > Built with Crystal >= 1.2
 
-> **Fibre safety:** Safe to call `#ask` from multiple fibres; the agent serialises requests through a single background fibre. Multi-thread mode (`-Dpreview_mt`) is not tested.
+> **Fiber safety:** Safe to call `#ask` from multiple fibers; the agent serialises requests through a single background fiber. Multi-thread mode (`-Dpreview_mt`) is not tested.
 
 ---
 
