@@ -22,7 +22,7 @@ Then run:
 shards install
 ```
 
-> Built with Crystal >= 1.10
+> Built with Crystal >= 1.2
 
 > **Thread safety:** The shard is designed to be multi-thread compatible — all shared state uses `Sync::Mutex` and `Sync::Exclusive` under the hood. However, it is currently tested and developed **without** the `-Dpreview_mt` flag. If you run with `preview_mt`, your mileage may vary. Contributions welcome.
 
@@ -76,7 +76,7 @@ resp.stream do |chunk|
   when Agent::Response::ChunkKind::Content
     print chunk.text
   when Agent::Response::ChunkKind::Reasoning
-    print "\e[2m#{chunk.text}\e[0m"  # dimmed for reasoning
+    print chunk.text.colorize(:dark_gray)  # dimmed for reasoning
   when Agent::Response::ChunkKind::ToolCallName
     puts "\n[Calling tool: #{chunk.text}]"
   when Agent::Response::ChunkKind::ToolCallArgs
@@ -125,9 +125,11 @@ Serialise a session (including cache key for prompt caching affinity):
 # Save
 File.write("session.json", agent.dump)
 
-# Restore
+# Restore — register tools first, then load session data:
 config = Agent::Config.new(api_key: ENV["OPENAI_API_KEY"])
-agent = Agent.load(config, File.read("session.json"))
+agent = Agent.new(config)
+agent.register_tool(...) { |args| ... }
+agent.load(File.read("session.json"))
 agent.ask("Continue where we left off")  # 🚀 cache hit
 ```
 
@@ -196,7 +198,7 @@ You can `register_tool` multiple times. All registered tools are merged into eve
 
 ### Tool activation control
 
-Register a tool as initially **disabled** — the definition is stored but not sent to the model until you `enable_tool`:
+You can register a tool as initially **disabled** — the definition is stored but not sent to the model until you `enable_tool`:
 
 ```crystal
 agent.register_tool("roll_dice", "Roll dice in NdS format",
@@ -218,16 +220,16 @@ agent.enabled_tools # => ["get_weather"]
 
 ### Session persistence
 
-`agent.dump` now includes the names of all enabled tools. On `Agent.load`, if the matching tool definitions have been re-registered (with callbacks) before loading, they are automatically re-enabled. Unknown tool names produce a warning and are silently skipped:
+> Saved session state (including enabled tools) is serialized via `agent.dump`. On restore, create a fresh agent, register your tools, then call `agent.load(data)` — it restores the session identity, history, and re-enables any tools that match:
 
 ```crystal
-# Before load, register all tools your app knows about:
+agent = Agent.new(config)
 agent.register_tool("get_weather", ...) { |args| ... }
 agent.register_tool("roll_dice", ..., enabled: false) { |args| ... }
 
-# Load the saved session — enabled_tools from the dump will be merged:
+# Restore session identity, history, and enabled-tool state:
 saved = File.read("session.json")
-agent = Agent.load(config, saved) # warnings for tools not re-registered
+agent.load(saved)  # warnings for tools not re-registered
 ```
 
 ### Disable auto-resolve
@@ -241,63 +243,58 @@ config = Agent::Config.new(
 )
 ```
 
-With `auto_execute_tools: false`, the agent returns tool calls to the caller and you dispatch manually:
+With `auto_execute_tools: false`, the agent returns tool calls to the caller and you dispatch manually in a loop. You pass tool definitions per-request (see [#tool-definitions](#tool-definitions) for the syntax) and implement the tool logic yourself with a `case`:
 
 ```crystal
-resp = agent.ask("What's the weather in Paris?")
-resp.join
+resp = agent.ask("What's the weather in Paris?", tools: [weather_tool])
+resp.stream { |chunk| print chunk }
+msg = resp.message
 
-if resp.message.has_tool_calls?
-  resp.message.tool_calls.not_nil!.each do |tc|
-    puts "Tool: #{tc.name}(#{tc.arguments})"
+while msg.has_tool_calls?
+  results = msg.tool_calls.not_nil!.map do |tc|
+    args = JSON.parse(tc.arguments).as_h
+    case tc.name
+    when "get_weather"
+      result = fetch_weather(args["city"].to_s)
+      Agent::Message.tool_result(tc, result)
+    else
+      Agent::Message.tool_result(tc, "Unknown tool: #{tc.name}")
+    end
   end
+
+  resp = agent.ask(results, tools: [weather_tool])
+  resp.stream { |chunk| print chunk }
+  msg = resp.message
 end
+
+puts msg.content
 ```
 
-### Legacy manual dispatch
+### Tool definitions
 
-You can also pass tools per-request without registering them:
+When passing tools per-request without `register_tool`, you build a `Tool` object directly. Use `Agent::JSONConverter` to avoid the `JSON::Any.new(...)` boilerplate:
 
 ```crystal
 weather_tool = Agent::Tool.new(Agent::Tool::FunctionDef.new(
   name: "get_weather",
   description: "Get the current weather for a city",
-  parameters: {
-    "type"       => JSON::Any.new("object"),
-    "properties" => JSON::Any.new({
-      "city" => JSON::Any.new({"type" => JSON::Any.new("string")}),
-    }),
-  }
+  parameters: Agent::JSONConverter.from({
+    type:       "object",
+    properties: {
+      city: {type: "string", description: "The city name"},
+    },
+    required: ["city"],
+  })
 ))
-
-resp = agent.ask(
-  "What's the weather in Paris?",
-  tools: [weather_tool]
-)
-resp.join
 ```
 
-To feed results back to the model:
-
-```crystal
-results = resp.message.tool_calls.not_nil!.map do |tc|
-  Agent::Message.new(
-    role: Agent::Role::Tool,
-    content: execute_tool(tc),
-    tool_call_id: tc.id,
-    name: tc.name,
-  )
-end
-
-final = agent.ask(results, tools: [weather_tool])
-final.stream { |chunk| print chunk.text }
-```
+Then pass it to `#ask`: `agent.ask("...", tools: [weather_tool])` — see the manual dispatch loop above for how to handle tool calls when they arrive.
 
 ---
 
 ## Provider system
 
-`agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, Anthropic via proxy, local llama.cpp, Ollama, etc.).
+`agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, OpenRouter, Anthropic via proxy, local llama.cpp, Ollama, etc.).
 
 ### Switch endpoint for a compatible API
 
@@ -414,7 +411,6 @@ Error types:
 | `Agent::ConnectionError` | Network / connection failure |
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |
-| `Agent::ToolArgumentError` | Tool call arguments don't match the parameter schema (includes `.tool_name`) |
 | `Agent::SessionLoadError` | Loading a saved session failed due to corrupt or missing fields |
 | `Agent::ClosedError` | An operation was attempted on a closed agent |
 
@@ -444,13 +440,15 @@ agent.close
 
 ### Prompt caching
 
-When using APIs that support prompt caching (e.g. OpenAI, DeepSeek), set an explicit `prompt_cache_key` or use `Agent.load` to restore a previous session — both preserve cache affinity:
+When using APIs that support prompt caching (e.g. OpenAI, DeepSeek), set an explicit `prompt_cache_key` or use `agent.load` to restore a previous session — both preserve cache affinity:
 
 ```crystal
 # Auto-generated cache key tied to the session
 agent = Agent.new(config)
-# vs restored session with the same cache_key
-agent = Agent.load(config, saved_session_string)
+
+# Restored session keeps the same cache_key:
+agent = Agent.new(config)
+agent.load(saved_session_string)
 ```
 
 ---

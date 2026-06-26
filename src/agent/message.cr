@@ -350,6 +350,31 @@ class Agent
     )
     end
 
+    # Create a system message.
+    def self.system(content : String) : self
+      new(role: Role::System, content: content)
+    end
+
+    # Create a user message.
+    def self.user(content : String) : self
+      new(role: Role::User, content: content)
+    end
+
+    # Create an assistant message.
+    def self.assistant(content : String? = nil, tool_calls : Array(ToolCall)? = nil, reasoning : String? = nil) : self
+      new(role: Role::Assistant, content: content, tool_calls: tool_calls, reasoning: reasoning)
+    end
+
+    # Create a tool-result message from a completed tool call.
+    # Convenient shorthand for building manual-dispatch results.
+    #
+    # ```
+    # msg = Agent::Message.tool_result(tc, "The weather is 22°C and sunny")
+    # ```
+    def self.tool_result(tool_call : ToolCall, content : String) : self
+      new(role: Role::Tool, content: content, tool_call_id: tool_call.id, name: tool_call.name)
+    end
+
     def has_tool_calls? : Bool
       tc = @tool_calls
       !tc.nil? && !tc.empty?

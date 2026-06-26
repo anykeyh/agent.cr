@@ -44,15 +44,4 @@ class Agent
       super("Failed to load session: #{reason}", cause: cause)
     end
   end
-
-  # Raised when a tool call provides invalid arguments
-  # that don't match the tool's parameter schema.
-  class ToolArgumentError < Error
-    getter tool_name : String
-    getter errors : Array(String)
-
-    def initialize(@tool_name : String, @errors : Array(String))
-      super("Tool '#{@tool_name}' received invalid arguments: #{@errors.join("; ")}")
-    end
-  end
 end

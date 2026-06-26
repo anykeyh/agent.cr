@@ -349,6 +349,15 @@ flowchart TD
 - If `http_post_stream` raises, the error message is returned and the loop
   exits (no retry).
 
+### Tool argument validation
+
+Tool call arguments are validated against the registered parameter schema
+(required fields + type checking). Validation failures are **soft** — they
+produce a tool-result `Message` with an error string (e.g.
+`"Error validating arguments for tool 'get_weather': Missing required field 'city'"`)
+and the callback is skipped. The model sees the error in its next turn
+and can self-correct. No exception is raised.
+
 ## To answer your questions directly
 
 ### Tool call ordering
