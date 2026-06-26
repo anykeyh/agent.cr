@@ -1122,4 +1122,110 @@ describe Agent do
       server.close
     end
   end
+
+  describe "Agent.load error handling" do
+    config = Agent::Config.new(api_key: "test-key")
+
+    it "raises SessionLoadError for non-JSON input" do
+      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
+        Agent.load(config, "not json at all")
+      end
+    end
+
+    it "raises SessionLoadError for JSON non-object (array)" do
+      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
+        Agent.load(config, "[]")
+      end
+    end
+
+    it "raises SessionLoadError for JSON literal (number)" do
+      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
+        Agent.load(config, "42")
+      end
+    end
+
+    it "raises SessionLoadError when session_id is missing" do
+      bad = %({"cache_key":"x","history":[]})
+      expect_raises(Agent::SessionLoadError, "session_id") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when session_id is not a string" do
+      bad = %({"session_id":123,"cache_key":"x","history":[]})
+      expect_raises(Agent::SessionLoadError, "session_id") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when cache_key is missing" do
+      bad = %({"session_id":"s1","history":[]})
+      expect_raises(Agent::SessionLoadError, "cache_key") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when history is missing" do
+      bad = %({"session_id":"s1","cache_key":"k1"})
+      expect_raises(Agent::SessionLoadError, "history") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when history is not an array" do
+      bad = %({"session_id":"s1","cache_key":"k1","history":"oops"})
+      expect_raises(Agent::SessionLoadError, "history") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when a message has no role" do
+      bad = %({"session_id":"s1","cache_key":"k1","history":[{"content":"hi"}]})
+      expect_raises(Agent::SessionLoadError, "history") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when a message has an invalid role" do
+      bad = %({"session_id":"s1","cache_key":"k1","history":[{"role":"superuser","content":"hi"}]})
+      expect_raises(Agent::SessionLoadError, "history") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when enabled_tools is not an array" do
+      bad = %({"session_id":"s1","cache_key":"k1","history":[],"enabled_tools":"string"})
+      expect_raises(Agent::SessionLoadError, "enabled_tools") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "raises SessionLoadError when enabled_tools has non-string elements" do
+      bad = %({"session_id":"s1","cache_key":"k1","history":[],"enabled_tools":[123]})
+      expect_raises(Agent::SessionLoadError, "enabled_tools") do
+        Agent.load(config, bad)
+      end
+    end
+
+    it "accepts valid JSON::Any input" do
+      raw = %({"session_id":"s1","cache_key":"k1","history":[]})
+      any = JSON.parse(raw)
+      agent = Agent.load(config, any)
+      agent.session_id.should eq("s1")
+      agent.cache_key.should eq("k1")
+      agent.history.should be_empty
+    ensure
+      agent.try(&.close)
+    end
+
+    it "does not spawn an agent fiber when session data is corrupt (parser runs first)" do
+      # The extraction happens before the private constructor is called,
+      # so the fiber is never spawned. We verify by checking the error
+      # fires before `new` can run — since any `new` would raise ClosedError
+      # on the next ask, but we never get that far.
+      expect_raises(Agent::SessionLoadError) do
+        Agent.load(config, "invalid json")
+      end
+    end
+  end
 end

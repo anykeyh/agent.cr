@@ -279,6 +279,10 @@ class Agent
   # Accepts a raw JSON string (shorthand) or a pre-parsed `JSON::Any` hash
   # (useful when the agent data lives inside a larger document).
   #
+  # Raises `Agent::SessionLoadError` if the session data is corrupt or
+  # malformed. The agent background fiber is **never** leaked — all parsing
+  # happens before the private constructor spawns the fiber.
+  #
   # ```
   # config = Agent::Config.new(model: "gpt-4o", api_key: ENV["OPENAI_API_KEY"])
   # agent = Agent.load(config, File.read("session.json"))
@@ -289,32 +293,71 @@ class Agent
   # agent = Agent.load(config, doc["session"])
   # ```
   def self.load(config : Config, data : String | JSON::Any, provider : Provider::Base? = nil) : Agent
-    parsed = data.is_a?(String) ? JSON.parse(data).as_h : data.as_h
-
-    session_id = parsed["session_id"].as_s
-    cache_key = parsed["cache_key"].as_s
+    session_id, cache_key, history, enabled_names = extract_session_data(data)
 
     agent = new(config, session_id, cache_key, provider: provider)
 
-    history = Array(Message).from_json(parsed["history"].to_json)
+    # Load history into the fiber.
     agent.load_history(history)
 
     # Restore enabled-tool names. Tools must have been re-registered
     # (with callbacks) before load for this to have any effect.
-    if enabled_data = parsed["enabled_tools"]?
-      enabled_names = enabled_data.as_a.map(&.as_s)
-      enabled_names.each do |name|
-        if agent.@registered_tools.has_key?(name)
-          # Inside the new agent fiber — mutate directly.
-          entry = agent.@registered_tools[name]
-          agent.@registered_tools[name] = entry.merge({enabled: true})
-        else
-          Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
-        end
+    enabled_names.each do |name|
+      if agent.@registered_tools.has_key?(name)
+        entry = agent.@registered_tools[name]
+        agent.@registered_tools[name] = entry.merge({enabled: true})
+      else
+        Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
       end
     end
 
     agent
+  end
+
+  # Extract and validate session fields from raw JSON data.
+  # All parsing occurs here, before the agent fiber is spawned, so any
+  # corruption raises a `SessionLoadError` without leaking resources.
+  private def self.extract_session_data(data : String | JSON::Any) : {String, String, Array(Message), Array(String)}
+    parsed = begin
+      h = data.is_a?(String) ? JSON.parse(data) : data
+      h.as_h
+    rescue ex
+      raise SessionLoadError.new("not a valid JSON object", cause: ex)
+    end
+
+    session_id = begin
+      parsed["session_id"]?.try(&.as_s)
+    rescue ex
+      raise SessionLoadError.new("'session_id' field missing or not a string", cause: ex)
+    end
+    raise SessionLoadError.new("'session_id' field missing or not a string") if session_id.nil?
+
+    cache_key = begin
+      parsed["cache_key"]?.try(&.as_s)
+    rescue ex
+      raise SessionLoadError.new("'cache_key' field missing or not a string", cause: ex)
+    end
+    raise SessionLoadError.new("'cache_key' field missing or not a string") if cache_key.nil?
+
+    history = begin
+      history_raw = parsed["history"]?
+      raise SessionLoadError.new("'history' field missing") if history_raw.nil?
+      Array(Message).from_json(history_raw.to_json)
+    rescue ex
+      raise SessionLoadError.new("'history' field is malformed", cause: ex)
+    end
+
+    enabled_names = begin
+      if (data = parsed["enabled_tools"]?)
+        data.as_a.map(&.as_s)
+      else
+        [] of String
+      end
+    rescue ex
+      raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
+    end
+
+    {session_id, cache_key, history, enabled_names}
   end
 
   # ---------------------------------------------------------------------------
@@ -543,14 +586,14 @@ class Agent
       end
 
       result = if cb = entry[:callback]
-                 begin
-                   cb.call(args_hash)
-                 rescue ex
-                   "Error executing tool '#{tc.name}': #{ex.message}"
-                 end
-               else
-                 "Error executing tool '#{tc.name}': no callback registered"
-               end
+                begin
+                  cb.call(args_hash)
+                rescue ex
+                  "Error executing tool '#{tc.name}': #{ex.message}"
+                end
+              else
+                "Error executing tool '#{tc.name}': no callback registered"
+              end
 
       results << Message.new(
         role: Role::Tool,

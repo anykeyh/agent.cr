@@ -366,12 +366,10 @@ def summarize_recent_history(history : Array(Agent::Message), max_exchanges : In
   history.each do |msg|
     case msg.role
     when Agent::Role::User
-      preview = (msg.content || "").lines.first.strip
-      exchanges << {msg.role, preview}
+      exchanges << {msg.role, (msg.content || "").strip}
     when Agent::Role::Assistant
       if text = msg.content
-        preview = text.lines.first.strip
-        exchanges << {msg.role, preview}
+        exchanges << {msg.role, text.strip}
       elsif (tc = msg.tool_calls) && !tc.empty?
         names = tc.map(&.name).join(", ")
         exchanges << {msg.role, "⚡ tool calls: #{names}"}
