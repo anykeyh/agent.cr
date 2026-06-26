@@ -148,8 +148,7 @@ class Agent
         data_uri = encode_as_data_uri(mime, bytes)
         new(type: PartType::ImageUrl, url: data_uri, mime_type: mime, filename: File.basename(path))
       elsif mime.starts_with?("audio/")
-        data_uri = encode_as_data_uri(mime, bytes)
-        new(type: PartType::InputAudio, url: data_uri, data: Base64.strict_encode(bytes), mime_type: mime, filename: File.basename(path))
+        new(type: PartType::InputAudio, data: Base64.strict_encode(bytes), mime_type: mime, filename: File.basename(path))
       elsif inlinable_text_type?(mime)
         new(type: PartType::Text, text: String.new(bytes), mime_type: mime, filename: File.basename(path))
       else

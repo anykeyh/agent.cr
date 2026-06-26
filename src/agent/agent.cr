@@ -117,7 +117,7 @@ class Agent
   # Returns the names of all currently enabled tools.
   # Thread-safe; acquires @registered_tools internally.
   def enabled_tools : Array(String)
-    @registered_tools.lock { |t| t.select { |_, v| v[:enabled] }.keys }
+    @registered_tools.lock(&.select { |_, v| v[:enabled] }.keys)
   end
 
   # Close the agent, shutting down the background fiber.
@@ -207,27 +207,10 @@ class Agent
   # agent.ask("Continue where we left off")
   # ```
   def load(data : String | JSON::Any) : Nil
-    h = begin
-      data.is_a?(String) ? JSON.parse(data) : data
-    rescue ex
-      raise SessionLoadError.new("not a valid JSON object", cause: ex)
-    end
-    parsed = h.as_h?
-    raise SessionLoadError.new("not a valid JSON object") if parsed.nil?
+    parsed = parse_session_data(data)
 
-    id = begin
-      parsed["session_id"]?.try(&.as_s)
-    rescue ex
-      raise SessionLoadError.new("'session_id' field missing or not a string", cause: ex)
-    end
-    raise SessionLoadError.new("'session_id' field missing or not a string") if id.nil?
-
-    key = begin
-      parsed["cache_key"]?.try(&.as_s)
-    rescue ex
-      raise SessionLoadError.new("'cache_key' field missing or not a string", cause: ex)
-    end
-    raise SessionLoadError.new("'cache_key' field missing or not a string") if key.nil?
+    id = parse_str_field(parsed, "session_id")
+    key = parse_str_field(parsed, "cache_key")
 
     history_raw = parsed["history"]?
     raise SessionLoadError.new("'history' field missing") if history_raw.nil?
@@ -237,15 +220,7 @@ class Agent
       raise SessionLoadError.new("'history' field is malformed", cause: ex)
     end
 
-    enabled_names = begin
-      if names = parsed["enabled_tools"]?
-        names.as_a.map(&.as_s)
-      else
-        [] of String
-      end
-    rescue ex
-      raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
-    end
+    enabled_names = parse_enabled_tools(parsed)
 
     @session_id = id
     @cache_key = key
@@ -261,6 +236,37 @@ class Agent
         end
       end
     end
+  end
+
+  private def parse_session_data(data : String | JSON::Any) : Hash(String, JSON::Any)
+    h = begin
+      data.is_a?(String) ? JSON.parse(data) : data
+    rescue ex
+      raise SessionLoadError.new("not a valid JSON object", cause: ex)
+    end
+    parsed = h.as_h?
+    raise SessionLoadError.new("not a valid JSON object") if parsed.nil?
+    parsed
+  end
+
+  private def parse_str_field(parsed : Hash(String, JSON::Any), field : String) : String
+    val = begin
+      parsed[field]?.try(&.as_s)
+    rescue ex
+      raise SessionLoadError.new("'#{field}' field missing or not a string", cause: ex)
+    end
+    raise SessionLoadError.new("'#{field}' field missing or not a string") if val.nil?
+    val
+  end
+
+  private def parse_enabled_tools(parsed : Hash(String, JSON::Any)) : Array(String)
+    if names = parsed["enabled_tools"]?
+      names.as_a.map(&.as_s)
+    else
+      [] of String
+    end
+  rescue ex
+    raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
   end
 
   # Reset the conversation history back to the system prompt only.
@@ -337,7 +343,7 @@ class Agent
   # Replaces the earlier channel-based DumpRequest round-trip.
   private def snapshot_session : DumpResult
     history_dup = @history.lock(&.dup)
-    enabled_names = @registered_tools.lock { |t| t.select { |_, v| v[:enabled] }.keys }
+    enabled_names = @registered_tools.lock(&.select { |_, v| v[:enabled] }.keys)
     DumpResult.new(
       session_id: @session_id,
       cache_key: @cache_key,
@@ -483,7 +489,7 @@ class Agent
       end
 
       # Append tool results to history under the lock, then rebuild messages for next iteration.
-      @history.lock { |h| h.concat(results) }
+      @history.lock(&.concat(results))
       history_snapshot = @history.lock(&.dup)
       messages = build_messages(history_snapshot, [] of Message)
     end
@@ -532,17 +538,6 @@ class Agent
         h
       end
     end
-  end
-
-  # Walk backwards from the given index (exclusive) to find the index of the
-  # preceding user message, ensuring we don't split a turn.
-  private def find_turn_boundary(start_idx : Int32) : Int32
-    idx = start_idx - 2
-    while idx >= 0
-      return idx if @history.lock { |h| h[idx].role == Role::User }
-      idx -= 1
-    end
-    0
   end
 
   # Execute all tool calls that have registered callbacks.

@@ -26,7 +26,7 @@ shards install
 
 > Built with Crystal >= 1.2
 
-> **Thread safety:** The shard is designed to be multi-thread compatible — all shared state uses `Sync::Mutex` and `Sync::Exclusive` under the hood. However, it is currently tested and developed **without** the `-Dpreview_mt` flag. If you run with `preview_mt`, your mileage may vary. Contributions welcome.
+> **Fibre safety:** Safe to call `#ask` from multiple fibres; the agent serialises requests through a single background fibre. Multi-thread mode (`-Dpreview_mt`) is not tested.
 
 ---
 
