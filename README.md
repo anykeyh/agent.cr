@@ -2,6 +2,8 @@
 
 A Crystal shard for building agentic loops with OpenAI-compatible APIs.
 
+Inspired by [RubyLLM](https://rubyllm.com/) — a fantastic Ruby gem for interacting with AI models.
+
 `agent-cr` wraps any OpenAI-compatible streaming chat-completion endpoint behind a fiber-based async interface. It handles streaming, tool calls, multimodal content, conversation history, and automatic tool resolution — all in a background fiber so your code never blocks.
 
 ---
