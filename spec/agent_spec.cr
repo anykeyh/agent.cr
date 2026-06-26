@@ -1218,11 +1218,8 @@ describe Agent do
       agent.try(&.close)
     end
 
-    it "does not spawn an agent fiber when session data is corrupt (parser runs first)" do
-      # The extraction happens before the private constructor is called,
-      # so the fiber is never spawned. We verify by checking the error
-      # fires before `new` can run — since any `new` would raise ClosedError
-      # on the next ask, but we never get that far.
+    it "still raises SessionLoadError when data is corrupt after creating the agent" do
+      # The agent is created first (fiber spawned), then data is parsed.
       expect_raises(Agent::SessionLoadError) do
         Agent.load(config, "invalid json")
       end

@@ -1,5 +1,6 @@
 require "colorize"
 require "json"
+require "time"
 require "../src/agent"
 
 # DnD RPG — An interactive dungeon-crawling adventure using registered tools.
@@ -387,7 +388,12 @@ def summarize_recent_history(history : Array(Agent::Message), max_exchanges : In
   end
 end
 
-def select_or_create_session(config : Agent::Config) : {Hero, Agent, Bool}
+# Tuple: hero, agent, resumed? (bool), optional session data (JSON::Any)
+# When resumed is true, the caller MUST register all tools before calling
+# agent.load_history(data["history"]) and restoring enabled_tool state.
+private record SessionChoice, hero : Hero, agent : Agent, resumed : Bool, session_data : JSON::Any?
+
+def select_or_create_session(config : Agent::Config) : SessionChoice
   sessions = list_sessions
 
   unless sessions.empty?
@@ -408,7 +414,7 @@ def select_or_create_session(config : Agent::Config) : {Hero, Agent, Bool}
         puts
         hero = select_hero
         agent = Agent.new(config)
-        return {hero, agent, false}
+        return SessionChoice.new(hero, agent, false, nil)
       end
 
       if num = input.to_i?
@@ -416,11 +422,13 @@ def select_or_create_session(config : Agent::Config) : {Hero, Agent, Bool}
           s = sessions[num - 1]
           raw = File.read(s[:path])
           parsed = JSON.parse(raw).as_h
-          agent = Agent.load(config, parsed["session"])
+          session_data = parsed["session"]
+          # Create a fresh agent — tools will be registered before restoring history.
+          agent = Agent.new(config)
           hero = Hero.from_json(parsed["hero"].to_json)
-          puts "  (Resumed session #{agent.session_id.colorize(:dark_gray)} as #{s[:hero_name].colorize(:yellow).bold})".colorize(:green)
+          puts "  (Resumed session #{s[:session_id].colorize(:dark_gray)} as #{s[:hero_name].colorize(:yellow).bold})".colorize(:green)
           puts
-          return {hero, agent, true}
+          return SessionChoice.new(hero, agent, true, session_data)
         end
       end
 
@@ -432,7 +440,7 @@ def select_or_create_session(config : Agent::Config) : {Hero, Agent, Bool}
   puts
   hero = select_hero
   agent = Agent.new(config)
-  {hero, agent, false}
+  SessionChoice.new(hero, agent, false, nil)
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -446,12 +454,23 @@ config = Agent::Config.new(
   system_prompt: DM_PROMPT
 )
 
-hero, agent, resumed = select_or_create_session(config)
+# IMPORTANT: Tools MUST be registered before restoring session state.
+# Agent.load would warn about missing tools if we called it first.
+# Instead, we create a fresh agent, register all tools, then restore
+# history and tool-enable state from the saved session data.
+
+choice = select_or_create_session(config)
+hero = choice.hero
+agent = choice.agent
+resumed = choice.resumed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Register all DnD game mechanic tools.
 # The hero state is captured in the closure and mutated by callbacks.
 # ──────────────────────────────────────────────────────────────────────────────
+
+# If resuming a session, register tools first, then restore history + tool state.
+# This avoids "tool not registered" warnings during load.
 
 # 1. hero_info — Full hero state for the DM.
 agent.register_tool("hero_info",
@@ -826,9 +845,20 @@ agent.register_tool("apply_status",
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Restore saved session state (if resuming) — tools are now registered,
+# so load will find them without warnings.
+# ──────────────────────────────────────────────────────────────────────────────
+if resumed
+  if session_data = choice.session_data
+    agent.load(session_data)
+  end
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main game loop
 # ──────────────────────────────────────────────────────────────────────────────
 puts
+puts "═══ Welcome, #{hero.name.colorize(:yellow).bold}! ═══"
 puts "═══ Welcome, #{hero.name.colorize(:yellow).bold}! ═══".colorize(:green)
 puts hero_summary(hero)
 
@@ -844,17 +874,7 @@ puts
 unless resumed
   begin
     response = agent.ask("Begin the parody adventure! Describe where #{hero.name} finds themselves — probably in a rundown tavern, behind on rent, about to take a quest from someone who clearly has no authority to give one. Set the absurd scene. End by asking what they'd like to do.")
-    response.stream do |chunk|
-      if chunk.reasoning?
-        STDOUT.print chunk.text.colorize(:dark_gray)
-      elsif chunk.tool_call_name?
-        STDOUT.print "⚡ #{chunk.text}".colorize(:yellow)
-      elsif chunk.tool_call_args?
-        STDOUT.print chunk.text.colorize(:light_cyan)
-      else
-        STDOUT.print chunk.text
-      end
-    end
+    stream_with_dm_narration(response)
     STDOUT.puts
     puts
     save_session(hero, agent)
@@ -866,6 +886,55 @@ end
 
 puts "── Commands: /hero  /reset  /exit  /help ──".colorize(:dark_gray)
 puts
+
+# Stream response chunks with reasoning hidden behind a "The DM is preparing your adventure..."
+# spinner. Reasoning content is not shown to the player.
+def stream_with_dm_narration(response : Agent::Response) : Nil
+  spinner_ch : Channel(Nil)? = nil
+  saw_reasoning = false
+
+  response.stream do |chunk|
+    if chunk.reasoning?
+      unless saw_reasoning
+        saw_reasoning = true
+        ch = Channel(Nil).new
+        spinner_ch = ch
+        # Capture the local channel for the fiber — compiler can narrow the type
+        ch_ref = ch
+        spawn do
+          frames = ["", ".", "..", "..."]
+          idx = 0
+          loop do
+            select
+            when _ = ch_ref.receive?
+              break
+            when timeout(1.second)
+              STDOUT.print "\rThe DM is preparing your adventure#{frames[idx % 4]}   "
+              STDOUT.flush
+              idx += 1
+            end
+          end
+          STDOUT.print "\r" + " " * 50 + "\r"
+          STDOUT.flush
+        end
+      end
+    elsif chunk.content?
+      # First content chunk — stop spinner, show the content
+      if ch = spinner_ch
+        ch.close
+        spinner_ch = nil
+      end
+
+      STDOUT.print chunk.text
+    end
+    # Tool call name/args chunks are skipped entirely — the model
+    # narrates outcomes naturally in its next content response.
+  end
+ensure
+  if ch = spinner_ch
+    ch.close
+  end
+end
 
 def read_multiline : String?
   print "⚔️ ".colorize(:yellow)
@@ -928,18 +997,7 @@ loop do
 
   begin
     response = agent.ask(input)
-
-    response.stream do |chunk|
-      if chunk.reasoning?
-        STDOUT.print chunk.text.colorize(:dark_gray)
-      elsif chunk.tool_call_name?
-        STDOUT.print "⚡ #{chunk.text}".colorize(:yellow)
-      elsif chunk.tool_call_args?
-        STDOUT.print chunk.text.colorize(:light_cyan)
-      else
-        STDOUT.print chunk.text
-      end
-    end
+    stream_with_dm_narration(response)
 
     STDOUT.puts
     puts

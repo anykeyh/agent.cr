@@ -28,7 +28,7 @@ class Agent
 
   @request_channel : Channel(Request)
   @fiber : Fiber
-  @state_mutex : Sync::Mutex  # protects @closed
+  @state_mutex : Sync::Mutex # protects @closed
   @closed = false
 
   # Protected shared state via Sync::Exclusive.
@@ -45,20 +45,6 @@ class Agent
   def initialize(@config : Config, provider : Provider::Base? = nil)
     @session_id = Random::Secure.hex(16)
     @cache_key = @config.prompt_cache_key || "agent-cr:#{@session_id}"
-    @history = Sync::Exclusive(Array(Message)).new([] of Message)
-    @request_channel = Channel(Request).new
-    @registered_tools = Sync::Exclusive(Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool))).new(
-      {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
-    )
-    @state_mutex = Sync::Mutex.new
-    @provider = provider || Provider::OpenAI.new(@config, @cache_key)
-    @http_client = build_http_client
-    @fiber = spawn { run_loop }
-  end
-
-  # Internal: create an Agent with a pre-determined session_id and cache_key.
-  # Used by `self.load` to restore a previous session's cache affinity.
-  private def initialize(@config : Config, @session_id : String, @cache_key : String, provider : Provider::Base? = nil)
     @history = Sync::Exclusive(Array(Message)).new([] of Message)
     @request_channel = Channel(Request).new
     @registered_tools = Sync::Exclusive(Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool))).new(
@@ -198,6 +184,85 @@ class Agent
     raise ClosedError.new
   end
 
+  # Restore session state from previously dumped session data.
+  #
+  # This restores session_id, cache_key, conversation history, and enabled-tool
+  # state — everything except the system prompt and tool definitions (those
+  # come from Config and from register_tool calls). Call this after creating
+  # a fresh Agent and registering all tools.
+  #
+  # Accepts a raw JSON string (shorthand) or a pre-parsed `JSON::Any` hash
+  # (useful when the agent data lives inside a larger document).
+  #
+  # Raises `Agent::SessionLoadError` if the session data is corrupt or
+  # malformed.
+  #
+  # NOTE: Calling #load while an #ask is in-flight is undefined behavior.
+  # Wait for any in-flight Response to complete (via #join) first.
+  #
+  # ```
+  # agent = Agent.new(config)
+  # agent.register_tool(...)
+  # agent.load(File.read("session.json"))
+  # agent.ask("Continue where we left off")
+  # ```
+  def load(data : String | JSON::Any) : Nil
+    h = begin
+      data.is_a?(String) ? JSON.parse(data) : data
+    rescue ex
+      raise SessionLoadError.new("not a valid JSON object", cause: ex)
+    end
+    parsed = h.as_h?
+    raise SessionLoadError.new("not a valid JSON object") if parsed.nil?
+
+    id = begin
+      parsed["session_id"]?.try(&.as_s)
+    rescue ex
+      raise SessionLoadError.new("'session_id' field missing or not a string", cause: ex)
+    end
+    raise SessionLoadError.new("'session_id' field missing or not a string") if id.nil?
+
+    key = begin
+      parsed["cache_key"]?.try(&.as_s)
+    rescue ex
+      raise SessionLoadError.new("'cache_key' field missing or not a string", cause: ex)
+    end
+    raise SessionLoadError.new("'cache_key' field missing or not a string") if key.nil?
+
+    history_raw = parsed["history"]?
+    raise SessionLoadError.new("'history' field missing") if history_raw.nil?
+    history = begin
+      Array(Message).from_json(history_raw.to_json)
+    rescue ex
+      raise SessionLoadError.new("'history' field is malformed", cause: ex)
+    end
+
+    enabled_names = begin
+      if names = parsed["enabled_tools"]?
+        names.as_a.map(&.as_s)
+      else
+        [] of String
+      end
+    rescue ex
+      raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
+    end
+
+    @session_id = id
+    @cache_key = key
+
+    load_history(history)
+
+    @registered_tools.lock do |tools|
+      enabled_names.each do |name|
+        if tools.has_key?(name)
+          tools[name] = tools[name].merge({enabled: true})
+        else
+          Log.warn { "Agent#load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
+        end
+      end
+    end
+  end
+
   # Reset the conversation history back to the system prompt only.
   #
   # NOTE: Calling #reset while an #ask is in-flight is undefined behavior.
@@ -288,107 +353,21 @@ class Agent
     history : Array(Message),
     enabled_tools : Array(String)
 
-  # Restore an Agent from previously dumped session data.
+  # Create an Agent and restore session state from previously dumped data.
   #
-  # The caller provides a fresh Config (with current API key, endpoint, model).
-  # The restored agent carries the same session_id, cache_key, and history as
-  # the original, so prompt cache affinity is preserved.
-  #
-  # Accepts a raw JSON string (shorthand) or a pre-parsed `JSON::Any` hash
-  # (useful when the agent data lives inside a larger document).
-  #
-  # Raises `Agent::SessionLoadError` if the session data is corrupt or
-  # malformed. The agent background fiber is **never** leaked — all parsing
-  # happens before the private constructor spawns the fiber.
-  #
+  # Convenience shorthand equivalent to:
   # ```
-  # config = Agent::Config.new(model: "gpt-4o", api_key: ENV["OPENAI_API_KEY"])
-  # agent = Agent.load(config, File.read("session.json"))
-  # agent.ask("Continue where we left off") # 🚀 cache hit
-  #
-  # # Or from a nested document:
-  # doc = JSON.parse(File.read("save.json")).as_h
-  # agent = Agent.load(config, doc["session"])
+  # agent = Agent.new(config, provider: provider)
+  # agent.register_tool(...)
+  # agent.load(data)
   # ```
+  #
+  # Accepts a raw JSON string (shorthand) or a pre-parsed `JSON::Any` hash.
+  # Raises `Agent::SessionLoadError` if the session data is corrupt.
   def self.load(config : Config, data : String | JSON::Any, provider : Provider::Base? = nil) : Agent
-    session_id, cache_key, history, enabled_names = extract_session_data(data)
-
-    agent = new(config, session_id, cache_key, provider: provider)
-
-    # Load history into the fiber.
-    agent.load_history(history)
-
-    # Restore enabled-tool names. Tools must have been re-registered
-    # (with callbacks) before load for this to have any effect.
-    agent.@registered_tools.lock do |t|
-      enabled_names.each do |name|
-        if t.has_key?(name)
-          t[name] = t[name].merge({enabled: true})
-        else
-          Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
-        end
-      end
-    end
-
+    agent = new(config, provider: provider)
+    agent.load(data)
     agent
-  end
-
-  # Extract and validate session fields from raw JSON data.
-  # All parsing occurs here, before the agent fiber is spawned, so any
-  # corruption raises a `SessionLoadError` without leaking resources.
-  private def self.extract_session_data(data : String | JSON::Any) : {String, String, Array(Message), Array(String)}
-    parsed = parse_session_root(data)
-    {
-      parse_session_id(parsed),
-      parse_cache_key(parsed),
-      parse_history(parsed),
-      parse_enabled_tools(parsed),
-    }
-  end
-
-  private def self.parse_session_root(data : String | JSON::Any) : Hash(String, JSON::Any)
-    h = data.is_a?(String) ? JSON.parse(data) : data
-    h.as_h
-  rescue ex
-    raise SessionLoadError.new("not a valid JSON object", cause: ex)
-  end
-
-  private def self.parse_session_id(parsed : Hash(String, JSON::Any)) : String
-    id = begin
-      parsed["session_id"]?.try(&.as_s)
-    rescue ex
-      raise SessionLoadError.new("'session_id' field missing or not a string", cause: ex)
-    end
-    raise SessionLoadError.new("'session_id' field missing or not a string") if id.nil?
-    id
-  end
-
-  private def self.parse_cache_key(parsed : Hash(String, JSON::Any)) : String
-    key = begin
-      parsed["cache_key"]?.try(&.as_s)
-    rescue ex
-      raise SessionLoadError.new("'cache_key' field missing or not a string", cause: ex)
-    end
-    raise SessionLoadError.new("'cache_key' field missing or not a string") if key.nil?
-    key
-  end
-
-  private def self.parse_history(parsed : Hash(String, JSON::Any)) : Array(Message)
-    history_raw = parsed["history"]?
-    raise SessionLoadError.new("'history' field missing") if history_raw.nil?
-    Array(Message).from_json(history_raw.to_json)
-  rescue ex
-    raise SessionLoadError.new("'history' field is malformed", cause: ex)
-  end
-
-  private def self.parse_enabled_tools(parsed : Hash(String, JSON::Any)) : Array(String)
-    if data = parsed["enabled_tools"]?
-      data.as_a.map(&.as_s)
-    else
-      [] of String
-    end
-  rescue ex
-    raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
   end
 
   # ---------------------------------------------------------------------------
