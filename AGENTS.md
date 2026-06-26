@@ -15,11 +15,26 @@ src/
   agent.cr              # entry point, requires sub-files
   agent/
     version.cr           # VERSION constant
-    config.cr            # Agent::Config — API endpoint, key, model, system_prompt, etc.
+    config.cr            # Agent::Config — generic fields (system_prompt, max_history, timeouts)
+    error.cr             # Agent::Error hierarchy
+    json_converter.cr    # JSONConverter helper for tool param schemas
     message.cr           # Agent::Message, ContentPart, ToolCall, Usage
     response.cr          # Agent::Response — async handle with stream/join/finished
-    agent.cr             # Agent + Tool — main loop, HTTP streaming, request serialisation
+    tool.cr              # Agent::Tool / FunctionDef (extracted from agent.cr)
+    agent.cr             # Agent — fiber loop, history, tool resolution (no HTTP/SSE code)
+    provider.cr          # requires provider/ modules
+    provider/
+      base.cr            # Agent::Provider::Base — abstract interface
+      openai/
+        openai.cr        # entry point, requires sub-files
+        config.cr        # Provider::OpenAI < Base + OpenAI::Config
+        request_body.cr  # OpenAI wire-format request builder
+        stream_parser.cr # SSE parser, delta accumulation, usage parsing
 ```
+
+### Provider separation
+
+All wire-format concerns live in `Provider::Base` implementations. The default `Provider::OpenAI` handles the OpenAI /v1/chat/completions format. The `Agent` core talks only to the abstract interface.
 
 ## Architecture diagram
 
@@ -28,6 +43,7 @@ sequenceDiagram
     participant Caller
     participant Agent
     participant Fiber
+    participant Provider as Provider::OpenAI
     participant HTTP as HTTP::Client
     participant API as OpenAI API
 
@@ -36,18 +52,22 @@ sequenceDiagram
     Agent-->>Caller: return Response (immediately)
 
     Fiber->>Fiber: receive(Request) from channel
-    Fiber->>HTTP: POST /v1/chat/completions (stream=true)
+    Fiber->>Provider: build_request(messages, tools)
+    Provider-->>Fiber: {path, headers, body}
+    Fiber->>HTTP: POST (path, headers, body)
     HTTP->>API: HTTPS request
     API-->>HTTP: SSE stream
     loop each SSE chunk
         HTTP-->>Fiber: yield line
-        Fiber->>Response: push_chunk(delta)
+        Fiber->>Provider: parse_stream(io, response)
+        Provider->>Response: push_chunk(delta)
         alt caller called #stream
             Response->>Caller: chunk via channel
         else caller blocks on #message
             Response: buffer in @chunk_channel (size 256)
         end
     end
+    Provider-->>Fiber: {Message, Usage, finish_reason}
     Fiber->>Response: finish(message, usage)
     Response->>Caller: #message / #metadata unblock
 ```
@@ -63,10 +83,11 @@ Each `Agent.new(config)` spawns a persistent fiber:
 ```
 
 `run_loop` blocks on `@request_channel.receive`. When a `Request` arrives it
-calls `http_post_stream` directly, processes the SSE stream, and appends the
-assistant reply to `@history`. After the HTTP call completes, the fiber loops
-back and waits for the next request. This serialises requests through one
-fiber — no locking needed.
+calls `http_post_stream` which delegates to the provider for building the
+request and parsing the response. The assistant reply is appended to
+`@history`. After the HTTP call completes, the fiber loops back and waits
+for the next request. This serialises requests through one fiber — no
+locking needed.
 
 ### Request / Response decoupling
 
@@ -74,14 +95,31 @@ fiber — no locking needed.
 1. Builds a `Message`
 2. Creates a fresh `Response` object and sends an `AskRequest` (new_messages + tools + response) on `@request_channel`
 
-The fiber receives the request in `process_request_loop` (L327) and appends the
-messages to `@history` inside the fiber (L335), ensuring single-owner mutation.
+The fiber receives the request in `process_request_loop` and appends the
+messages to `@history` inside the fiber, ensuring single-owner mutation.
 
 It returns the `Response` immediately. The calling fiber is free to read
 chunks, wait for the message, or do other work.
 
-Appending inside the fiber (rather than in `#ask`) avoids races between
-`close()` and `#ask()` — the fiber owns history exclusively.
+### Provider separation
+
+All wire-format concerns live in `Agent::Provider::Base` implementations.
+The `http_post_stream` shim in `agent.cr` is provider-agnostic:
+
+```crystal
+req = @provider.build_request(messages, tools)
+client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
+  msg, usage, finish_reason = @provider.parse_stream(
+    http_resp.body_io, response, ->{ response.cancelled? }
+  )
+  raise CancelledError.new if response.cancelled?
+  {msg, usage, finish_reason}
+end
+```
+
+Auth headers, request body shape, SSE parsing, and final message assembly are
+all owned by the provider. To support a non-OpenAI API, implement `Base` and
+pass it to `Agent.new(config, provider: MyProvider.new(...))`.
 
 ### Buffered chunk channel
 
@@ -113,54 +151,6 @@ Closing `chunk_channel` after the block ensures the `ensure` runs even if
 `push_chunk` uses `send` (not `try_send` / `spawn`) because the buffer is
 large enough for typical streaming. If the buffer somehow fills up, the HTTP
 fiber will briefly block — this is acceptable backpressure.
-
-## SSE parsing
-
-The streaming handler in `http_post_stream` reads `body_io.each_line` and
-processes SSE `data:` lines:
-
-- Lines that are empty, `data: [DONE]`, or don't start with `data: ` are
-  skipped.
-- The `data: ` prefix is stripped, the remainder is parsed as JSON.
-- Tool call deltas are accumulated across chunks by index (OpenAI sends
-  `id` on the first delta and `arguments` in pieces).
-- Usage metadata is parsed from whichever chunk contains it (usually the
-  final chunk with `finish_reason: "stop"`).
-
-## Messages
-
-### Content serialisation
-
-`Message#to_request_body` produces the JSON hash sent to the API. Content
-can be:
-- A plain string (`role: "user", content: "hello"`)
-- An array of content parts (text + image_urls for multimodal)
-- `null` (tool result messages, tool call messages)
-
-The `JSON::Any` wrapping is verbose but necessary — Crystal's JSON builder
-requires explicit `JSON::Any` wrapping when building hash literals.
-
-### Tool calls
-
-`ToolCall` stores `id`, `name`, and `arguments` (a JSON string). On the wire
-they're formatted as:
-
-```json
-{
-  "tool_calls": [{
-    "id": "call_abc",
-    "type": "function",
-    "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
-  }]
-}
-```
-
-### Reasoning content
-
-Reasoning (e.g. `reasoning_content` from DeepSeek/Qwen models) is **not**
-merged into `message.content`. It is stored separately in
-`message.reasoning` and streamed as `ChunkKind::Reasoning` chunks. This
-keeps `content` clean for downstream consumers.
 
 ## Quirks and gotchas
 

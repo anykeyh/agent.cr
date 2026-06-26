@@ -179,7 +179,7 @@ describe Agent do
       agent = Agent.new(config)
       resp = agent.ask(
         "What's in this image?",
-        images: ["https://example.com/photo.jpg"]
+        attachments: ["https://example.com/photo.jpg"]
       )
       resp.join
 
@@ -189,7 +189,8 @@ describe Agent do
       user_msg.content_parts.try do |parts|
         parts.size.should eq(2)
         parts[0].text.should eq("What's in this image?")
-        parts[1].image_url.should eq("https://example.com/photo.jpg")
+        parts[1].url.should eq("https://example.com/photo.jpg")
+        parts[1].type.should eq(Agent::ContentPart::PartType::ImageUrl)
       end
     end
   end

@@ -10,8 +10,8 @@ describe Agent::Message do
 
   it "builds a multimodal message body" do
     parts = [
-      Agent::ContentPart.new(text: "What is this?"),
-      Agent::ContentPart.new(image_url: "https://example.com/img.jpg"),
+      Agent::ContentPart.new(type: :text, text: "What is this?"),
+      Agent::ContentPart.new(type: :image_url, url: "https://example.com/img.jpg"),
     ]
     msg = Agent::Message.new(role: Agent::Role::User, content_parts: parts)
     body = msg.to_request_body
@@ -39,13 +39,14 @@ end
 
 describe Agent::ContentPart do
   it "produces image JSON" do
-    part = Agent::ContentPart.new(image_url: "https://ex.com/i.png", image_detail: "high")
+    part = Agent::ContentPart.new(type: :image_url, url: "https://ex.com/i.png", image_detail: "high")
     json = part.to_json_body
     json["type"].as_s.should eq("image_url")
+    json["image_url"].as_h["url"].as_s.should eq("https://ex.com/i.png")
   end
 
   it "produces text JSON" do
-    part = Agent::ContentPart.new(text: "Hello")
+    part = Agent::ContentPart.new(type: :text, text: "Hello")
     json = part.to_json_body
     json["type"].as_s.should eq("text")
     json["text"].as_s.should eq("Hello")
@@ -67,6 +68,59 @@ describe Agent::Usage do
     u.prompt_tokens.should be_nil
     u.completion_tokens.should be_nil
     u.total_tokens.should be_nil
+  end
+
+  it "produces file JSON" do
+    part = Agent::ContentPart.new(type: :file, url: "data:application/pdf;base64,AAAA", filename: "doc.pdf", mime_type: "application/pdf")
+    json = part.to_json_body
+    json["type"].as_s.should eq("file")
+    json["file"].as_h["file_data"].as_s.should eq("data:application/pdf;base64,AAAA")
+    json["file"].as_h["filename"].as_s.should eq("doc.pdf")
+  end
+
+  it "produces audio JSON" do
+    part = Agent::ContentPart.new(type: :input_audio, data: "base64data", mime_type: "audio/wav")
+    json = part.to_json_body
+    json["type"].as_s.should eq("input_audio")
+    json["input_audio"].as_h["format"].as_s.should eq("wav")
+    json["input_audio"].as_h["data"].as_s.should eq("base64data")
+  end
+
+  it "resolves a remote URL to ImageUrl or File" do
+    part = Agent::ContentPart.from_path("https://example.com/photo.jpg")
+    part.type.should eq(Agent::ContentPart::PartType::ImageUrl)
+    part.url.should eq("https://example.com/photo.jpg")
+    part.mime_type.should eq("image/jpeg")
+
+    part2 = Agent::ContentPart.from_path("https://example.com/doc.pdf")
+    part2.type.should eq(Agent::ContentPart::PartType::File)
+    part2.url.should eq("https://example.com/doc.pdf")
+    part2.mime_type.should eq("application/pdf")
+  end
+
+  it "resolves a local text file to Text part" do
+    # Use a tempfile
+    filename = File.tempname("agent-test", ".md")
+    File.write(filename, "# Hello\n\nThis is a test.")
+    part = Agent::ContentPart.from_path(filename)
+    part.type.should eq(Agent::ContentPart::PartType::Text)
+    part.text.should eq("# Hello\n\nThis is a test.")
+    part.mime_type.should eq("text/markdown")
+    part.filename.should eq(File.basename(filename))
+  ensure
+    File.delete(filename) if filename && File.exists?(filename)
+  end
+
+  it "resolves a local image file to ImageUrl part" do
+    filename = File.tempname("agent-test", ".png")
+    File.write(filename, Bytes[0x89, 0x50, 0x4E, 0x47]) # minimal PNG header
+    part = Agent::ContentPart.from_path(filename)
+    part.type.should eq(Agent::ContentPart::PartType::ImageUrl)
+    part.url.should_not be_nil
+    part.url.should match(/^data:image\/png;base64,/)
+    part.mime_type.should eq("image/png")
+  ensure
+    File.delete(filename) if filename && File.exists?(filename)
   end
 
   it "accepts values" do
