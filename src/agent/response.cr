@@ -78,46 +78,51 @@ class Agent
       @mutex = Sync::Mutex.new
     end
 
+    # Shorthand for @mutex.synchronize — used by all flag accessors.
+    private def synchronize(&)
+      @mutex.synchronize { yield }
+    end
+
     # Request cancellation of this in-flight response.
     # The HTTP fiber will abort after the current SSE line is processed.
     # Safe to call from any fiber. Idempotent.
     # After cancellation, #message returns a "Agent error: cancelled" message
     # and #error returns a CancelledError.
     def cancel : Nil
-      @mutex.synchronize { @cancelled = true }
+      synchronize { @cancelled = true }
     end
 
     # Returns true if cancel was requested.
     def cancelled? : Bool
-      @mutex.synchronize { @cancelled }
+      synchronize { @cancelled }
     end
 
     # Returns true when the response has finished assembling.
     def finished? : Bool
-      @mutex.synchronize { @done }
+      synchronize { @done }
     end
 
     # The reason the stream finished ("stop", "length", "tool_calls", etc.)
     # or nil if not known / the request errored.
     def finish_reason : String?
-      @mutex.synchronize { @finish_reason }
+      synchronize { @finish_reason }
     end
 
     # Returns the error if this response represents a failed request, or nil.
     def error : Agent::Error?
-      @mutex.synchronize { @error }
+      synchronize { @error }
     end
 
     # Returns true if this response represents a failed request.
     def error? : Bool
-      @mutex.synchronize { !@error.nil? }
+      synchronize { !@error.nil? }
     end
 
     # Return the fully assembled message (blocks until ready).
     def message : Message
       @message ||= begin
         msg = @message_channel.receive
-        @mutex.synchronize { @message = msg }
+        synchronize { @message = msg }
         msg
       end
     rescue Channel::ClosedError
@@ -128,7 +133,7 @@ class Agent
     def metadata : Usage
       @metadata ||= begin
         meta = @usage_channel.receive
-        @mutex.synchronize { @metadata = meta }
+        synchronize { @metadata = meta }
         meta
       end
     rescue Channel::ClosedError
@@ -144,7 +149,7 @@ class Agent
     # Yields each chunk as it arrives from the API.
     # Use `chunk.text` for the string and `chunk.kind` for its origin.
     def stream(& : Chunk -> _) : Nil
-      @mutex.synchronize { @streaming = true }
+      synchronize { @streaming = true }
       loop do
         chunk = @chunk_channel.receive
         yield chunk
@@ -164,7 +169,7 @@ class Agent
     #
     # When #stream is active, blocks until the consumer reads.
     def push_chunk(chunk : Chunk) : Nil
-      return unless @mutex.synchronize { @streaming }
+      return unless synchronize { @streaming }
 
       @chunk_channel.send(chunk)
     rescue Channel::ClosedError
@@ -174,7 +179,7 @@ class Agent
     # Internal: signal that the response is complete.
     # Safe to call multiple times — subsequent calls are no-ops.
     def finish(message : Message, usage : Usage, finish_reason : String? = nil) : Nil
-      @mutex.synchronize do
+      synchronize do
         return if @done
         @done = true
         @finish_reason = finish_reason
@@ -193,7 +198,7 @@ class Agent
     def finish_with_error(err : Agent::Error) : Nil
       error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
 
-      @mutex.synchronize do
+      synchronize do
         return if @done
         @done = true
         @error = err
