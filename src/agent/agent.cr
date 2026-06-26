@@ -15,10 +15,12 @@ class Agent
   private record RegisterToolRequest,
     name : String,
     tool : Tool,
-    callback : Hash(String, JSON::Any) -> String
+    callback : (Hash(String, JSON::Any) -> String)?,
+    enabled : Bool
+  private record EnableToolRequest, name : String, enabled : Bool, response : Response
   private record LoadHistoryRequest, messages : Array(Message), response : Response
 
-  private alias Request = AskRequest | ResetRequest | RegisterToolRequest | LoadHistoryRequest
+  private alias Request = AskRequest | ResetRequest | RegisterToolRequest | EnableToolRequest | LoadHistoryRequest
 
   getter config : Config
   getter history : Array(Message)
@@ -28,7 +30,7 @@ class Agent
   @request_channel : Channel(Request)
   @fiber : Fiber
   @closed = false
-  @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String))
+  @registered_tools : Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool))
 
   # Persistent HTTP client for connection pooling across requests.
   @http_client : HTTP::Client
@@ -40,7 +42,7 @@ class Agent
     @cache_key = @config.prompt_cache_key || "agent-cr:#{@session_id}"
     @history = [] of Message
     @request_channel = Channel(Request).new
-    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
+    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @http_client = build_http_client
     @fiber = spawn { run_loop }
@@ -51,7 +53,7 @@ class Agent
   private def initialize(@config : Config, @session_id : String, @cache_key : String, provider : Provider::Base? = nil)
     @history = [] of Message
     @request_channel = Channel(Request).new
-    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
+    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @http_client = build_http_client
     @fiber = spawn { run_loop }
@@ -77,20 +79,61 @@ class Agent
   #   "The weather in #{city} is sunny."
   # end
   # ```
-  def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, &block : Hash(String, JSON::Any) -> String) : Nil
+  def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, enabled : Bool = true, &block : Hash(String, JSON::Any) -> String) : Nil
     raise ClosedError.new if @closed
     raise ArgumentError.new("Tool name must not be empty") if name.empty?
 
     tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
-    entry = {tool: tool, callback: block}
+    entry = {tool: tool, callback: block, enabled: enabled}
 
     if Fiber.current == @fiber
       # Already inside the agent fiber — mutate directly to avoid deadlock.
       @registered_tools[name] = entry
     else
       # From another fiber — route through the request channel for ordering.
-      @request_channel.send(RegisterToolRequest.new(name, tool, block))
+      @request_channel.send(RegisterToolRequest.new(name, tool, block, enabled))
     end
+  end
+
+  # Enable a previously registered tool, making it available to the model.
+  # Returns `false` if no tool with that name is registered.
+  # Safe to call from any fiber.
+  def enable_tool(name : String) : Bool
+    raise ClosedError.new if @closed
+
+    if Fiber.current == @fiber
+      return false unless @registered_tools.has_key?(name)
+      @registered_tools[name] = @registered_tools[name].merge({enabled: true})
+      true
+    else
+      response = Response.new
+      @request_channel.send(EnableToolRequest.new(name, true, response))
+      response.join
+      true
+    end
+  end
+
+  # Disable a registered tool, hiding it from the model without unregistering it.
+  # Returns `false` if no tool with that name is registered.
+  # Safe to call from any fiber.
+  def disable_tool(name : String) : Bool
+    raise ClosedError.new if @closed
+
+    if Fiber.current == @fiber
+      return false unless @registered_tools.has_key?(name)
+      @registered_tools[name] = @registered_tools[name].merge({enabled: false})
+      true
+    else
+      response = Response.new
+      @request_channel.send(EnableToolRequest.new(name, false, response))
+      response.join
+      true
+    end
+  end
+
+  # Returns the names of all currently enabled tools.
+  def enabled_tools : Array(String)
+    @registered_tools.select { |_, v| v[:enabled] }.keys
   end
 
   # Close the agent, shutting down the background fiber.
@@ -202,6 +245,14 @@ class Agent
     json.field "session_id", @session_id
     json.field "cache_key", @cache_key
     json.field "history", @history
+
+    # Persist only the names of enabled tools.
+    # The actual tool definitions (with callbacks) are application code
+    # and must be re-registered before load.
+    enabled_names = enabled_tools
+    unless enabled_names.empty?
+      json.field "enabled_tools", enabled_names
+    end
   end
 
   # Serialise the current session to a JSON string.
@@ -247,6 +298,22 @@ class Agent
 
     history = Array(Message).from_json(parsed["history"].to_json)
     agent.load_history(history)
+
+    # Restore enabled-tool names. Tools must have been re-registered
+    # (with callbacks) before load for this to have any effect.
+    if enabled_data = parsed["enabled_tools"]?
+      enabled_names = enabled_data.as_a.map(&.as_s)
+      enabled_names.each do |name|
+        if agent.@registered_tools.has_key?(name)
+          # Inside the new agent fiber — mutate directly.
+          entry = agent.@registered_tools[name]
+          agent.@registered_tools[name] = entry.merge({enabled: true})
+        else
+          Log.warn { "Agent.load: tool '#{name}' was enabled in saved session but is not registered — skipping" }
+        end
+      end
+    end
+
     agent
   end
 
@@ -280,7 +347,20 @@ class Agent
         )
       in RegisterToolRequest
         # Register a tool from another fiber.
-        @registered_tools[request.name] = {tool: request.tool, callback: request.callback}
+        @registered_tools[request.name] = {tool: request.tool, callback: request.callback, enabled: request.enabled}
+      in EnableToolRequest
+        # Enable or disable a tool from another fiber.
+        if entry = @registered_tools[request.name]?
+          @registered_tools[request.name] = entry.merge({enabled: request.enabled})
+          request.response.finish(
+            Message.new(role: Role::Assistant, content: "Tool '#{request.name}' #{request.enabled ? "enabled" : "disabled"}."),
+            Usage.new,
+          )
+        else
+          request.response.finish_with_error(
+            Agent::Error.new("No registered tool named '#{request.name}'")
+          )
+        end
       in LoadHistoryRequest
         # Restore history from a saved session.
         @history.clear
@@ -430,7 +510,7 @@ class Agent
 
     tool_calls.each do |tc|
       entry = @registered_tools[tc.name]?
-      if entry.nil?
+      if entry.nil? || !entry[:enabled]
         return [] of Message
       end
 
@@ -439,7 +519,6 @@ class Agent
         parsed = JSON.parse(tc.arguments)
         parsed.as_h? || {} of String => JSON::Any
       rescue JSON::ParseException
-        # Let the model know its arguments were malformed.
         results << Message.new(
           role: Role::Tool,
           content: "Error parsing arguments for tool '#{tc.name}': invalid JSON",
@@ -449,11 +528,29 @@ class Agent
         next
       end
 
-      result = begin
-        entry[:callback].call(args_hash)
-      rescue ex
-        "Error executing tool '#{tc.name}': #{ex.message}"
+      # Validate arguments against the tool's parameter schema.
+      if params_schema = entry[:tool].function.parameters
+        errors = validate_tool_args(tc.name, args_hash, params_schema)
+        unless errors.empty?
+          results << Message.new(
+            role: Role::Tool,
+            content: "Error validating arguments for tool '#{tc.name}': #{errors.join("; ")}",
+            tool_call_id: tc.id,
+            name: tc.name,
+          )
+          next
+        end
       end
+
+      result = if cb = entry[:callback]
+                 begin
+                   cb.call(args_hash)
+                 rescue ex
+                   "Error executing tool '#{tc.name}': #{ex.message}"
+                 end
+               else
+                 "Error executing tool '#{tc.name}': no callback registered"
+               end
 
       results << Message.new(
         role: Role::Tool,
@@ -466,17 +563,78 @@ class Agent
     results
   end
 
+  # Validate tool call arguments against the tool's parameter JSON Schema.
+  # Returns an array of error messages (empty = valid).
+  private def validate_tool_args(tool_name : String, args : Hash(String, JSON::Any), schema : Hash(String, JSON::Any)) : Array(String)
+    errors = [] of String
+
+    props = schema["properties"]?.try(&.as_h?) || {} of String => JSON::Any
+    required = schema["required"]?.try(&.as_a?.try(&.map(&.as_s))) || [] of String
+
+    # Check required fields are present.
+    required.each do |field|
+      unless args.has_key?(field)
+        errors << "missing required field '#{field}'"
+      end
+    end
+
+    # Type-check provided fields against the schema.
+    args.each do |key, value|
+      prop = props[key]?.try(&.as_h?)
+      next if prop.nil?
+
+      expected_type = prop["type"]?.try(&.as_s?)
+      next if expected_type.nil? || value.raw.nil?
+
+      unless type_matches?(value.raw, expected_type)
+        errors << "field '#{key}' expected #{expected_type}, got #{type_name(value.raw)}"
+      end
+    end
+
+    errors
+  end
+
+  # Check if a JSON::Any raw value matches a JSON Schema type name.
+  private def type_matches?(raw : JSON::Any::Type?, expected_type : String) : Bool
+    case raw
+    when String  then expected_type == "string"
+    when Int64   then expected_type == "integer" || expected_type == "number"
+    when Float64 then expected_type == "number"
+    when Bool    then expected_type == "boolean"
+    when Array   then expected_type == "array"
+    when Hash    then expected_type == "object"
+    when Nil     then true # null can be anything
+    else              false
+    end
+  end
+
+  # Human-readable type name for a JSON::Any raw value.
+  private def type_name(raw : JSON::Any::Type?) : String
+    case raw
+    when String  then "string"
+    when Int64   then "integer"
+    when Float64 then "number"
+    when Bool    then "boolean"
+    when Array   then "array"
+    when Hash    then "object"
+    when Nil     then "null"
+    else              raw.class.to_s
+    end
+  end
+
   # Returns the combined tool list: per-request tools merged with registered tools.
   # Registered tools take precedence over per-request tools with the same name.
   private def combined_tools(tools : Array(Tool)?) : Array(Tool)?
-    if @registered_tools.empty?
+    enabled_reg = @registered_tools.select { |_, v| v[:enabled] }
+
+    if enabled_reg.empty?
       tools
     else
-      reg = @registered_tools.values.map(&.[:tool])
+      reg = enabled_reg.values.map(&.[:tool])
 
       if tools
-        # Filter out per-request tools whose name collides with registered tools
-        filtered = tools.reject { |t| @registered_tools.has_key?(t.function.name) }
+        # Filter out per-request tools whose name collides with enabled registered tools
+        filtered = tools.reject { |t| enabled_reg.has_key?(t.function.name) }
         filtered + reg
       else
         reg

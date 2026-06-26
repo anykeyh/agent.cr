@@ -192,6 +192,42 @@ puts resp.message.content # => "The weather in Paris is sunny."
 
 You can `register_tool` multiple times. All registered tools are merged into every request automatically. If a per-request tool has the same name as a registered tool, the registered callback wins.
 
+### Tool activation control
+
+Register a tool as initially **disabled** — the definition is stored but not sent to the model until you `enable_tool`:
+
+```crystal
+agent.register_tool("roll_dice", "Roll dice in NdS format",
+  parameters: params,
+  enabled: false
+) do |args|
+  # ...
+end
+
+# Later, activate it mid-conversation:
+agent.enable_tool("roll_dice")
+
+# Or deactivate without unregistering:
+agent.disable_tool("roll_dice")
+
+# Query which tools are currently active:
+agent.enabled_tools # => ["get_weather"]
+```
+
+### Session persistence
+
+`agent.dump` now includes the names of all enabled tools. On `Agent.load`, if the matching tool definitions have been re-registered (with callbacks) before loading, they are automatically re-enabled. Unknown tool names produce a warning and are silently skipped:
+
+```crystal
+# Before load, register all tools your app knows about:
+agent.register_tool("get_weather", ...) { |args| ... }
+agent.register_tool("roll_dice", ..., enabled: false) { |args| ... }
+
+# Load the saved session — enabled_tools from the dump will be merged:
+saved = File.read("session.json")
+agent = Agent.load(config, saved) # warnings for tools not re-registered
+```
+
 ### Disable auto-resolve
 
 To handle tool calls manually (e.g. only some tools are registered, or you need user approval):
