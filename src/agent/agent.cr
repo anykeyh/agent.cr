@@ -47,11 +47,14 @@ class Agent
     name : String,
     tool : Tool,
     callback : Hash(String, JSON::Any) -> String
+  private record LoadHistoryRequest, messages : Array(Message), response : Response
 
-  private alias Request = AskRequest | ResetRequest | RegisterToolRequest
+  private alias Request = AskRequest | ResetRequest | RegisterToolRequest | LoadHistoryRequest
 
   getter config : Config
   getter history : Array(Message)
+  getter session_id : String
+  getter cache_key : String
 
   @request_channel : Channel(Request)
   @fiber : Fiber
@@ -62,6 +65,18 @@ class Agent
   @http_client : HTTP::Client
 
   def initialize(@config : Config)
+    @session_id = Random::Secure.hex(16)
+    @cache_key = @config.prompt_cache_key || "agent-cr:#{@session_id}"
+    @history = [] of Message
+    @request_channel = Channel(Request).new
+    @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
+    @http_client = build_http_client
+    @fiber = spawn { run_loop }
+  end
+
+  # Internal: create an Agent with a pre-determined session_id and cache_key.
+  # Used by `self.load` to restore a previous session's cache affinity.
+  private def initialize(@config : Config, @session_id : String, @cache_key : String)
     @history = [] of Message
     @request_channel = Channel(Request).new
     @registered_tools = {} of String => NamedTuple(tool: Tool, callback: Hash(String, JSON::Any) -> String)
@@ -176,6 +191,89 @@ class Agent
     raise ClosedError.new
   end
 
+  # Restore the full conversation history.
+  # This replaces the current history with the given messages (e.g. from a
+  # previous `#dump`). The system prompt is NOT included — `build_messages`
+  # prepends it from Config as usual.
+  #
+  # Safe to call after a previous #ask has completed. Waits for the fiber to
+  # acknowledge the replacement before returning.
+  #
+  # Raises Agent::ClosedError if the agent has been closed.
+  def load_history(messages : Array(Message)) : Nil
+    raise ClosedError.new if @closed
+
+    response = Response.new
+    @request_channel.send(LoadHistoryRequest.new(messages, response))
+    response.join
+  rescue Channel::ClosedError
+    raise ClosedError.new
+  end
+
+  # Serialise the current session fields into an open JSON object.
+  # Call this inside a `json.object` block managed by the caller.
+  #
+  # ```
+  # JSON.build do |json|
+  #   json.object do
+  #     json.field "hero", hero
+  #     agent.dump(json)
+  #   end
+  # end
+  # ```
+  def dump(json : JSON::Builder) : Nil
+    json.field "version", 1
+    json.field "session_id", @session_id
+    json.field "cache_key", @cache_key
+    json.field "history", @history
+  end
+
+  # Serialise the current session to a JSON string.
+  # Includes session_id, cache_key, and the full message history.
+  # The output is suitable for later use with `Agent.load`.
+  #
+  # ```
+  # File.write("session.json", agent.dump)
+  # ```
+  def dump : String
+    JSON.build do |json|
+      json.object do
+        dump(json)
+      end
+    end
+  end
+
+  # Restore an Agent from previously dumped session data.
+  #
+  # The caller provides a fresh Config (with current API key, endpoint, model).
+  # The restored agent carries the same session_id, cache_key, and history as
+  # the original, so prompt cache affinity is preserved.
+  #
+  # Accepts a raw JSON string (shorthand) or a pre-parsed `JSON::Any` hash
+  # (useful when the agent data lives inside a larger document).
+  #
+  # ```
+  # config = Agent::Config.new(model: "gpt-4o", api_key: ENV["OPENAI_API_KEY"])
+  # agent = Agent.load(config, File.read("session.json"))
+  # agent.ask("Continue where we left off") # 🚀 cache hit
+  #
+  # # Or from a nested document:
+  # doc = JSON.parse(File.read("save.json")).as_h
+  # agent = Agent.load(config, doc["session"])
+  # ```
+  def self.load(config : Config, data : String | JSON::Any) : Agent
+    parsed = data.is_a?(String) ? JSON.parse(data).as_h : data.as_h
+
+    session_id = parsed["session_id"].as_s
+    cache_key = parsed["cache_key"].as_s
+
+    agent = new(config, session_id, cache_key)
+
+    history = Array(Message).from_json(parsed["history"].to_json)
+    agent.load_history(history)
+    agent
+  end
+
   # ---------------------------------------------------------------------------
   # Internal
   # ---------------------------------------------------------------------------
@@ -207,6 +305,14 @@ class Agent
       in RegisterToolRequest
         # Register a tool from another fiber.
         @registered_tools[request.name] = {tool: request.tool, callback: request.callback}
+      in LoadHistoryRequest
+        # Restore history from a saved session.
+        @history.clear
+        @history.concat(request.messages)
+        request.response.finish(
+          Message.new(role: Role::Assistant, content: "History restored (#{request.messages.size} messages)."),
+          Usage.new,
+        )
       in AskRequest
         process_request_loop(request)
       end
@@ -613,9 +719,10 @@ class Agent
 
   private def build_request_body(messages : Array(Message), tools : Array(Tool)?) : Hash(String, JSON::Any)
     body = {
-      "model"    => JSON::Any.new(@config.model),
-      "messages" => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
-      "stream"   => JSON::Any.new(true),
+      "model"            => JSON::Any.new(@config.model),
+      "prompt_cache_key" => JSON::Any.new(@cache_key),
+      "messages"         => JSON::Any.new(messages.map(&.to_request_body).map { |h| JSON::Any.new(h) }),
+      "stream"           => JSON::Any.new(true),
     }
 
     if mt = @config.max_tokens

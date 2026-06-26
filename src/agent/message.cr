@@ -30,8 +30,24 @@ class Agent
     end
   end
 
+  # JSON converter for Role serialization with JSON::Serializable.
+  module RoleConverter
+    extend self
+
+    def to_json(value : Role, json : JSON::Builder) : Nil
+      json.string(value.to_s)
+    end
+
+    def from_json(value : JSON::PullParser) : Role
+      Role.parse(value.read_string)
+    end
+  end
+
   # A content part used in multimodal messages (text + images).
+  @[JSON::Serializable::Options(emit_nulls: true)]
   class ContentPart
+    include JSON::Serializable
+
     getter text : String?
     getter image_url : String?
     getter image_detail : String?
@@ -49,7 +65,7 @@ class Agent
           "type"      => JSON::Any.new("image_url"),
           "image_url" => JSON::Any.new({
             "url"    => JSON::Any.new(url),
-            "detail" => JSON::Any.new(@image_detail),
+            "detail" => JSON::Any.new(@image_detail || "auto"),
           }.to_h),
         }
       else
@@ -62,21 +78,53 @@ class Agent
   end
 
   # Represents a tool call from the assistant.
+  @[JSON::Serializable::Options(emit_nulls: true)]
   class ToolCall
+    include JSON::Serializable
+
     getter id : String
     getter name : String
-    getter arguments : String # JSON string
+    getter arguments : String
 
     def initialize(@id : String, @name : String, @arguments : String)
+    end
+
+    # :nodoc:
+    def ==(other : self) : Bool
+      @id == other.id && @name == other.name && @arguments == other.arguments
+    end
+
+    def ==(other) : Bool
+      false
+    end
+  end
+
+  # Token usage metadata from the API.
+  @[JSON::Serializable::Options(emit_nulls: true)]
+  class Usage
+    include JSON::Serializable
+
+    getter prompt_tokens : Int32?
+    getter completion_tokens : Int32?
+    getter total_tokens : Int32?
+
+    def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
     end
   end
 
   # A message in the conversation.
+  @[JSON::Serializable::Options(emit_nulls: true)]
   class Message
+    include JSON::Serializable
+
+    @[JSON::Field(key: "role", converter: Agent::RoleConverter)]
     getter role : Role
     getter content : String?
+    @[JSON::Field(key: "content_parts")]
     getter content_parts : Array(ContentPart)?
+    @[JSON::Field(key: "tool_calls")]
     getter tool_calls : Array(ToolCall)?
+    @[JSON::Field(key: "tool_call_id")]
     getter tool_call_id : String?
     getter name : String?
     getter reasoning : String?
@@ -154,16 +202,6 @@ class Agent
       end
 
       body
-    end
-  end
-
-  # Token usage metadata from the API.
-  class Usage
-    getter prompt_tokens : Int32?
-    getter completion_tokens : Int32?
-    getter total_tokens : Int32?
-
-    def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
     end
   end
 end

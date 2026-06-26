@@ -14,6 +14,9 @@ class Agent
     getter? auto_execute_tools : Bool
     getter extra_headers : Hash(String, String)?
     getter max_tool_iterations : Int32?
+    # Explicit prompt cache key. If nil, Agent auto-generates one as
+    # "agent-cr:<16-char-hex>" from its own session_id.
+    getter prompt_cache_key : String?
 
     # Cached parsed URI — computed once at construction.
     getter parsed_uri : URI
@@ -31,6 +34,7 @@ class Agent
       @auto_execute_tools : Bool = true,
       @extra_headers : Hash(String, String)? = nil,
       @max_tool_iterations : Int32? = 100,
+      @prompt_cache_key : String? = nil,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)

@@ -1,2 +1,3 @@
 lib
 bin/ameba
+examples/rpg/*.json
