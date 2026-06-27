@@ -229,6 +229,16 @@ cancel channel after each SSE line and aborts cleanly, calling
 - Crystal >= 1.10
 - `OPENAI_API_KEY` environment variable set when running integration tests against a real API.
 
+### Example configuration pattern
+
+All examples follow this precedence for configuration values:
+
+1. **CLI arguments** (`--endpoint`, `--model`, `--api-key`) — checked first
+2. **Environment variables** (`LLM_ENDPOINT`, `LLM_MODEL`, `LLM_API_KEY`) — fallback
+3. **Raise error** if neither is provided
+
+There are **no hardcoded defaults** in the examples.
+
 ### Setup
 
 ```sh

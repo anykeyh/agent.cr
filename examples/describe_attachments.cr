@@ -14,16 +14,16 @@ Dotenv.load(".env.local")
 #   crystal run examples/describe_attachments.cr -- ./photo.jpg ./doc.md sound.wav
 #   crystal run examples/describe_attachments.cr -- ./doc.pdf --model gpt-4o
 #
-# Environment variables:
-#   LLM_API_KEY     — API key
-#   LLM_ENDPOINT    — API base URL (default: https://api.openai.com/v1)
-#   LLM_MODEL       — Model name  (default: gpt-4o)
+# Configuration (checked in order): CLI arguments > environment variables > error
+#   --endpoint / LLM_ENDPOINT    — API base URL
+#   --model    / LLM_MODEL       — Model name
+#   --api-key  / LLM_API_KEY     — API key
 
 STDOUT.sync = true
 
-endpoint = ENV["LLM_ENDPOINT"]? || "https://api.openai.com/v1"
-model = ENV["LLM_MODEL"]? || "gpt-4o"
-api_key = ENV["LLM_API_KEY"]?
+endpoint = nil
+model = nil
+api_key = nil
 
 sources = [] of String
 
@@ -47,9 +47,9 @@ while i < args_iter.size
     puts "  source ...            One or more URLs or local file paths"
     puts
     puts "Options:"
-    puts "  --endpoint URL        API endpoint (default: $LLM_ENDPOINT)"
-    puts "  --model NAME          Model name (default: $LLM_MODEL)"
-    puts "  --api-key KEY         API key (default: $LLM_API_KEY)"
+    puts "  --endpoint URL        API endpoint (env: LLM_ENDPOINT)"
+    puts "  --model NAME          Model name (env: LLM_MODEL)"
+    puts "  --api-key KEY         API key (env: LLM_API_KEY)"
     puts "  --help                Show this help"
     exit 0
   when "--"
@@ -65,6 +65,16 @@ while i < args_iter.size
     i += 1
   end
 end
+
+# Fall back to environment variables for values not set via CLI
+endpoint = ENV["LLM_ENDPOINT"]? if endpoint.nil?
+model = ENV["LLM_MODEL"]? if model.nil?
+api_key = ENV["LLM_API_KEY"]? if api_key.nil?
+
+# Raise if any required value is still missing
+raise "Missing API endpoint. Set via --endpoint or LLM_ENDPOINT environment variable." if endpoint.nil?
+raise "Missing model name. Set via --model or LLM_MODEL environment variable." if model.nil?
+raise "Missing API key. Set via --api-key or LLM_API_KEY environment variable." if api_key.nil?
 
 if sources.empty?
   puts "Usage: crystal run examples/describe_attachments.cr -- <url_or_path> [...]"
