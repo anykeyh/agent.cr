@@ -1,0 +1,155 @@
+class Agent
+  # Mutable context for the full turn (request → LLM response).
+  # Handlers may mutate messages/tools before the HTTP request is built.
+  # (Post-processing of the returned {Message, Usage, String?} tuple is not
+  # supported by the current shape; the block returns the tuple directly.)
+  class TurnContext
+    property messages : Array(Message)
+    property tools : Array(Tool)?
+
+    def initialize(@messages, @tools)
+    end
+  end
+
+  # Mutable context for a single streaming chunk.
+  # Handlers should reassign `ctx.chunk = Chunk.new(...)` rather than
+  # attempting to mutate fields in place.
+  class ChunkContext
+    property chunk : Response::Chunk
+
+    def initialize(@chunk)
+    end
+  end
+
+  # Mutable context for a single tool call, before execution.
+  # `response` is provided so a handler can cancel the in-flight request.
+  class ToolCallContext
+    property tool_call : ToolCall
+    property response : Response
+
+    def initialize(@tool_call, @response)
+    end
+  end
+
+  # Mutable context for an exception that escaped the pipeline.
+  # Handlers may wrap or replace the error before it's recorded.
+  # `error` is typed `Exception` because the generic rescue branch can land
+  # any exception here; handler blocks must produce an `Agent::Error`.
+  class ErrorContext
+    property error : Exception
+
+    def initialize(@error)
+    end
+  end
+
+  # Base class for a handler in the chain.
+  #
+  # Each `handle` overload receives the context for one stage of the pipeline
+  # and a `next` proc that invokes the rest of the chain. The default
+  # implementation is a pass-through: it simply calls `next.call(ctx)` and
+  # returns the result. Subclasses override the overloads they care about and
+  # may inspect/mutate the context before and/or after yielding to `next`.
+  #
+  # A handler that does not want to forward to the rest of the chain can
+  # short-circuit by returning a value without calling `next`.
+  class Handler
+    def handle(ctx : TurnContext, next_proc : TurnContext -> {Message, Usage, String?}) : {Message, Usage, String?}
+      next_proc.call(ctx)
+    end
+
+    def handle(ctx : ChunkContext, next_proc : ChunkContext -> Response::Chunk) : Response::Chunk
+      next_proc.call(ctx)
+    end
+
+    def handle(ctx : ToolCallContext, next_proc : ToolCallContext -> Message) : Message
+      next_proc.call(ctx)
+    end
+
+    def handle(ctx : ErrorContext, next_proc : ErrorContext -> Agent::Error) : Agent::Error
+      next_proc.call(ctx)
+    end
+  end
+
+  # Runs a chain of `Handler`s around a block.
+  #
+  # `decorate` builds a nested chain of `handle` calls ending in the supplied
+  # block, then invokes the outermost handler. Each handler can yield to the
+  # next by calling `next.call(ctx)`. The chain is iterated left-to-right in
+  # the order handlers were added via `Agent#use`.
+  class ChainHandler
+    @chain : Array(Handler)
+
+    def initialize
+      @chain = [] of Handler
+    end
+
+    def <<(handler : Handler) : self
+      @chain << handler
+      self
+    end
+
+    def empty? : Bool
+      @chain.empty?
+    end
+
+    def decorate(context : TurnContext, &block : TurnContext -> {Message, Usage, String?}) : {Message, Usage, String?}
+      build_turn(@chain.each, block).call(context)
+    end
+
+    def decorate(context : ChunkContext, &block : ChunkContext -> Response::Chunk) : Response::Chunk
+      build_chunk(@chain.each, block).call(context)
+    end
+
+    def decorate(context : ToolCallContext, &block : ToolCallContext -> Message) : Message
+      build_tool_call(@chain.each, block).call(context)
+    end
+
+    def decorate(context : ErrorContext, &block : ErrorContext -> Agent::Error) : Agent::Error
+      build_error(@chain.each, block).call(context)
+    end
+
+    # Each `build_*` walks the handler iterator and returns a proc that, when
+    # called with a context, invokes the current handler's `handle` with a
+    # `next` proc continuing the chain. When the iterator is exhausted the
+    # leaf block is the next call.
+    private def build_turn(iter, leaf : TurnContext -> {Message, Usage, String?}) : TurnContext -> {Message, Usage, String?}
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_turn(iter, leaf)
+        ->(ctx : TurnContext) { current.handle(ctx, rest) }
+      end
+    end
+
+    private def build_chunk(iter, leaf : ChunkContext -> Response::Chunk) : ChunkContext -> Response::Chunk
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_chunk(iter, leaf)
+        ->(ctx : ChunkContext) { current.handle(ctx, rest) }
+      end
+    end
+
+    private def build_tool_call(iter, leaf : ToolCallContext -> Message) : ToolCallContext -> Message
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_tool_call(iter, leaf)
+        ->(ctx : ToolCallContext) { current.handle(ctx, rest) }
+      end
+    end
+
+    private def build_error(iter, leaf : ErrorContext -> Agent::Error) : ErrorContext -> Agent::Error
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_error(iter, leaf)
+        ->(ctx : ErrorContext) { current.handle(ctx, rest) }
+      end
+    end
+  end
+end

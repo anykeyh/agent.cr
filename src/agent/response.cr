@@ -24,9 +24,14 @@ class Agent
     end
 
     # A streamed text chunk tagged with its origin.
-    struct Chunk
-      getter text : String
-      getter kind : ChunkKind
+    #
+    # This is a class (not a struct) so that handler chains can replace the
+    # chunk object on `ChunkContext` and have the mutation be visible to the
+    # caller. Handlers should reassign `ctx.chunk = Chunk.new(...)` rather
+    # than attempting to mutate fields in place.
+    class Chunk
+      property text : String
+      property kind : ChunkKind
 
       def initialize(@text : String, @kind : ChunkKind = ChunkKind::Content)
       end
@@ -57,6 +62,14 @@ class Agent
     # Signals the final Usage metadata.
     private getter usage_channel : Channel(Usage)
 
+    # Optional callback: transform each chunk before it reaches the stream consumer.
+    # Set by Agent to wire the on_chunk handler. Returns the (possibly mutated) chunk.
+    #
+    # Cleared by #finish and #finish_with_error so the proc does not retain a
+    # closure reference to the Agent after the response completes. Callers
+    # should not reassign this once the response is in flight.
+    property chunk_handler : (Chunk -> Chunk)?
+
     # --- mutex-protected shared state ---
 
     @mutex : Sync::Mutex
@@ -65,6 +78,7 @@ class Agent
     @streaming = false
     @finish_reason : String?
     @error : Agent::Error?
+    @chunk_handler : (Chunk -> Chunk)?
 
     # Cached values so the second call to #message / #metadata
     # does not block on the channel again.
@@ -75,6 +89,7 @@ class Agent
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
       @message_channel = Channel(Message).new(1)
       @usage_channel = Channel(Usage).new(1)
+      @chunk_handler = nil
       @mutex = Sync::Mutex.new
     end
 
@@ -171,6 +186,9 @@ class Agent
     def push_chunk(chunk : Chunk) : Nil
       return unless synchronize { @streaming }
 
+      if handler = @chunk_handler
+        chunk = handler.call(chunk)
+      end
       @chunk_channel.send(chunk)
     rescue Channel::ClosedError
       # already finished
@@ -189,6 +207,7 @@ class Agent
       @message_channel.send(message)
       @usage_channel.send(usage)
     ensure
+      @chunk_handler = nil
       @chunk_channel.close
     end
 
@@ -208,6 +227,7 @@ class Agent
       @message_channel.send(error_msg)
       @usage_channel.send(Usage.new)
     ensure
+      @chunk_handler = nil
       @chunk_channel.close
     end
   end

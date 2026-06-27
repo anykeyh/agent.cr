@@ -41,6 +41,8 @@ class Agent
   @http_client : HTTP::Client
   # The provider handles all wire-format concerns.
   @provider : Provider::Base
+  # Chain of handler decorators.
+  @handlers : ChainHandler
 
   def initialize(@config : Config, provider : Provider::Base? = nil)
     @session_id = Random::Secure.hex(16)
@@ -53,7 +55,16 @@ class Agent
     @state_mutex = Sync::Mutex.new
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @http_client = build_http_client
+    @handlers = ChainHandler.new
     @fiber = spawn { run_loop }
+  end
+
+  # Append a `Handler` to the chain. Handlers run left-to-right in the order
+  # they were added, wrapping each stage of the request pipeline (turn,
+  # chunk, tool call, error). See `Agent::Handler`.
+  def use(handler : Handler) : self
+    @handlers << handler
+    self
   end
 
   # Register a tool with a callback that will be called automatically when the
@@ -450,6 +461,9 @@ class Agent
         break
       end
 
+      response.chunk_handler = ->(chunk : Response::Chunk) {
+        @handlers.decorate(ChunkContext.new(chunk), &.chunk)
+      }
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
       # On error, http_post_stream already called response.finish/finish_with_error.
@@ -476,7 +490,7 @@ class Agent
 
       # ameba:disable Lint/NotNil
       tool_calls = msg.tool_calls.not_nil!
-      results = execute_registered_tools(tool_calls)
+      results = execute_registered_tools(tool_calls, response)
 
       # If some tools had no registered handler, stop and let the caller handle it.
       # NOTE: The assistant(tool_calls) is already in @history. The caller MUST
@@ -545,7 +559,7 @@ class Agent
   # tool call has no registered handler.
   # If a callback raises, the error is caught and returned as a tool-result
   # message with an error description, so the agent fiber never dies.
-  private def execute_registered_tools(tool_calls : Array(ToolCall)) : Array(Message)
+  private def execute_registered_tools(tool_calls : Array(ToolCall), response : Response) : Array(Message)
     results = [] of Message
 
     tool_calls.each do |tc|
@@ -582,22 +596,26 @@ class Agent
         end
       end
 
-      result = if cb = entry[:callback]
-                 begin
-                   cb.call(args_hash)
-                 rescue ex
-                   "Error executing tool '#{tc.name}': #{ex.message}"
+      result_msg = @handlers.decorate(ToolCallContext.new(tc, response)) do |ctx|
+        result = if cb = entry[:callback]
+                   begin
+                     cb.call(args_hash)
+                   rescue ex
+                     "Error executing tool '#{ctx.tool_call.name}': #{ex.message}"
+                   end
+                 else
+                   "Error executing tool '#{ctx.tool_call.name}': no callback registered"
                  end
-               else
-                 "Error executing tool '#{tc.name}': no callback registered"
-               end
 
-      results << Message.new(
-        role: Role::Tool,
-        content: result,
-        tool_call_id: tc.id,
-        name: tc.name,
-      )
+        Message.new(
+          role: Role::Tool,
+          content: result,
+          tool_call_id: ctx.tool_call.id,
+          name: ctx.tool_call.name,
+        )
+      end
+
+      results << result_msg
     end
 
     results
@@ -701,39 +719,45 @@ class Agent
     tools : Array(Tool)?,
     response : Response,
   ) : {Message, Usage, String?}
-    all_tools = combined_tools(tools)
-    req = @provider.build_request(messages, all_tools)
-    client = @http_client
+    @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
+      all_tools = combined_tools(ctx.tools)
+      req = @provider.build_request(ctx.messages, all_tools)
+      client = @http_client
 
-    begin
-      client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
-        unless http_resp.status.ok?
-          raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
+      begin
+        client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
+          unless http_resp.status.ok?
+            raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
+          end
+
+          msg, usage, finish_reason = @provider.parse_stream(
+            http_resp.body_io,
+            response,
+            -> { response.cancelled? },
+          )
+
+          # If the response was cancelled mid-stream, treat it as an error.
+          if response.cancelled?
+            raise CancelledError.new
+          end
+
+          {msg, usage, finish_reason}
         end
-
-        msg, usage, finish_reason = @provider.parse_stream(
-          http_resp.body_io,
-          response,
-          -> { response.cancelled? },
-        )
-
-        # If the response was cancelled mid-stream, treat it as an error.
-        if response.cancelled?
-          raise CancelledError.new
-        end
-
-        {msg, usage, finish_reason}
+      rescue ex : ApiError
+        err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+        response.finish_with_error(err)
+        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
+      rescue ex : CancelledError
+        err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+        response.finish_with_error(err)
+        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
+      rescue ex
+        err = @handlers.decorate(ErrorContext.new(ex)) { |c|
+          ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
+        }
+        response.finish_with_error(err)
+        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
       end
-    rescue ex : ApiError
-      response.finish_with_error(ex)
-      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
-    rescue ex : CancelledError
-      response.finish_with_error(ex)
-      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
-    rescue ex
-      err = ConnectionError.new(ex.message || ex.class.name, cause: ex)
-      response.finish_with_error(err)
-      {Message.new(role: Role::Assistant, content: "Agent error: #{ex.message || ex.class.name}"), Usage.new, nil}
     end
   end
 
