@@ -50,14 +50,9 @@ while i < args_iter.size
 end
 
 # Fall back to environment variables for values not set via CLI
-endpoint = ENV["LLM_ENDPOINT"]? if endpoint.nil?
-model = ENV["LLM_MODEL"]? if model.nil?
-api_key = ENV["LLM_API_KEY"]? if api_key.nil?
-
-# Raise if any required value is still missing
-raise "Missing API endpoint. Set via --endpoint or LLM_ENDPOINT environment variable." if endpoint.nil?
-raise "Missing model name. Set via --model or LLM_MODEL environment variable." if model.nil?
-raise "Missing API key. Set via --api-key or LLM_API_KEY environment variable." if api_key.nil?
+endpoint = endpoint || ENV.fetch("LLM_ENDPOINT") { raise "Missing LLM_ENDPOINT" }
+model = model || ENV.fetch("LLM_MODEL", "gpt-4o")
+api_key = api_key || ENV.fetch("LLM_API_KEY", "")
 
 PROMPT = <<-MD
 You are a chatbot used to test a library called agent.cr;

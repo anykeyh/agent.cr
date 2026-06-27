@@ -237,14 +237,9 @@ while arg_i < args_iter.size
 end
 
 # Fall back to environment variables for values not set via CLI
-endpoint = ENV["LLM_ENDPOINT"]? if endpoint.nil?
-model = ENV["LLM_MODEL"]? if model.nil?
-api_key = ENV["LLM_API_KEY"]? if api_key.nil?
-
-# Raise if any required value is still missing
-raise "Missing API endpoint. Set via --endpoint or LLM_ENDPOINT environment variable." if endpoint.nil?
-raise "Missing model name. Set via --model or LLM_MODEL environment variable." if model.nil?
-raise "Missing API key. Set via --api-key or LLM_API_KEY environment variable." if api_key.nil?
+endpoint = endpoint || ENV.fetch("LLM_ENDPOINT") { raise "Missing LLM_ENDPOINT" }
+model = model || ENV.fetch("LLM_MODEL", "gpt-4o")
+api_key = api_key || ENV.fetch("LLM_API_KEY", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DM system prompt
@@ -603,7 +598,12 @@ agent.register_tool("roll_check",
     end
     io << " = **#{total}**"
 
-    if dc
+    # Nat 20 / nat 1 are critical success / critical failure regardless of DC.
+    if raw == 20
+      io << " ✨ **NAT 20 — CRITICAL SUCCESS!**"
+    elsif raw == 1
+      io << " 💀 **NAT 1 — CRITICAL FAILURE!**"
+    elsif dc
       if total >= dc
         io << " ✅ **SUCCESS** (DC #{dc})"
       else
@@ -868,6 +868,68 @@ if resumed
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Dice announce handler — surfaces dice rolls to the player.
+# ──────────────────────────────────────────────────────────────────────────────
+# The DM's tool calls (roll_check, roll_damage) run inside the agent fiber via
+# the auto-resolve loop, so their results are normally invisible to the player
+# — the DM is expected to narrate outcomes in its next content turn. This
+# handler intercepts the two dice-rolling tools, prints a "rolling" line with
+# the *context* of the roll (what it's for, sourced from the tool arguments),
+# then runs the callback and prints the formatted result string it returns.
+# Nat 20 / nat 1 / success / failure are already baked into the result string by
+# the tool callbacks, so we just echo it.
+#
+# Other tools (hero_info, take_damage, add_item, etc.) pass through silently —
+# the DM narrates those outcomes in prose.
+class DiceAnnounceHandler < Agent::Handler
+  DICE_TOOLS = {"roll_check", "roll_damage"}
+
+  def handle(ctx : Agent::ToolCallContext, next_proc) : Agent::Message
+    tc = ctx.tool_call
+    name = tc.name
+
+    unless DICE_TOOLS.includes?(name)
+      return next_proc.call(ctx)
+    end
+
+    # Parse the arguments so we can announce *what* the roll is for. The args
+    # string is JSON; if it fails to parse we just announce the tool name.
+    args = begin
+      JSON.parse(tc.arguments).as_h? || {} of String => JSON::Any
+    rescue JSON::ParseException
+      {} of String => JSON::Any
+    end
+
+    context = case name
+              when "roll_check"
+                args["check_type"]?.try(&.as_s?) || "an ability check"
+              when "roll_damage"
+                args["source"]?.try(&.as_s?) || "an attack"
+              else
+                "a roll"
+              end
+
+    STDOUT.puts
+    STDOUT.puts "  🎲 DM rolls — #{context}".colorize(:cyan)
+    STDOUT.print "  "
+    STDOUT.flush
+
+    # Run the actual callback. The result message's content is the formatted
+    # roll string (dice, total, nat 20 / success / failure).
+    result_msg = next_proc.call(ctx)
+
+    # Print the result on its own line, indented under the announcement.
+    STDOUT.puts result_msg.content.colorize(:yellow)
+    STDOUT.puts
+    STDOUT.flush
+
+    result_msg
+  end
+end
+
+agent.use(DiceAnnounceHandler.new)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main game loop
 # ──────────────────────────────────────────────────────────────────────────────
 puts
@@ -902,24 +964,36 @@ puts
 
 # Stream response chunks with reasoning hidden behind a "The DM is preparing your adventure..."
 # spinner. Reasoning content is not shown to the player.
+#
+# The spinner runs in its own fiber. To avoid racing the spinner's line-clear
+# against content being printed by this fiber, we use two channels:
+#   * `stop` — closed by the main fiber to ask the spinner to stop.
+#   * `done` — sent on by the spinner *after* it has cleared the line.
+# The main fiber waits on `done` before printing any content, so the spinner
+# can never overwrite already-printed narration.
 def stream_with_dm_narration(response : Agent::Response) : Nil
-  spinner_ch : Channel(Nil)? = nil
+  spinner_stop : Channel(Nil)? = nil
+  spinner_done : Channel(Nil)? = nil
   saw_reasoning = false
 
   response.stream do |chunk|
     if chunk.reasoning?
       unless saw_reasoning
         saw_reasoning = true
-        ch = Channel(Nil).new
-        spinner_ch = ch
-        # Capture the local channel for the fiber — compiler can narrow the type
-        ch_ref = ch
+        stop = Channel(Nil).new
+        done = Channel(Nil).new
+        spinner_stop = stop
+        spinner_done = done
+        # Capture non-nil locals for the spawned fiber; the compiler can't
+        # narrow the ivar type inside the closure.
+        stop_ref = stop
+        done_ref = done
         spawn do
           frames = ["", ".", "..", "..."]
           idx = 0
           loop do
             select
-            when _ = ch_ref.receive?
+            when _ = stop_ref.receive?
               break
             when timeout(1.second)
               STDOUT.print "\rThe DM is preparing your adventure#{frames[idx % 4]}   "
@@ -927,25 +1001,38 @@ def stream_with_dm_narration(response : Agent::Response) : Nil
               idx += 1
             end
           end
+          # Clear the spinner line before signalling done, so the main fiber
+          # never prints content that we then wipe out.
           STDOUT.print "\r" + " " * 50 + "\r"
           STDOUT.flush
+          done_ref.send(nil)
         end
       end
     elsif chunk.content?
-      # First content chunk — stop spinner, show the content
-      if ch = spinner_ch
-        ch.close
-        spinner_ch = nil
+      # First content chunk — stop the spinner and wait for it to finish
+      # clearing its line before we print anything.
+      if stop = spinner_stop
+        spinner_stop = nil
+        stop.close
+        if d = spinner_done
+          d.receive?
+          spinner_done = nil
+        end
       end
 
       STDOUT.print chunk.text
     end
-    # Tool call name/args chunks are skipped entirely — the model
-    # narrates outcomes naturally in its next content response.
+    # Tool call name/args chunks are not printed here — dice roll outcomes
+    # are surfaced by DiceAnnounceHandler (which runs inside the agent fiber
+    # when the tool callback executes), and other tool outcomes are narrated
+    # by the DM in its next content response.
   end
 ensure
-  if ch = spinner_ch
-    ch.close
+  if stop = spinner_stop
+    stop.close
+    if d = spinner_done
+      d.receive?
+    end
   end
 end
 

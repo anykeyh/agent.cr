@@ -238,6 +238,14 @@ All examples follow this precedence for configuration values:
 3. **Raise error** if neither is provided
 
 There are **no hardcoded defaults** in the examples.
+Only `LLM_ENDPOINT` is required; `LLM_MODEL` and `LLM_API_KEY` are optional and can be `nil`.
+The minimal pattern looks like:
+
+```crystal
+endpoint = ENV.fetch("LLM_ENDPOINT") { raise "Missing LLM_ENDPOINT" }
+model = ENV["LLM_MODEL"]?
+api_key = ENV["LLM_API_KEY"]?
+```
 
 ### Setup
 
