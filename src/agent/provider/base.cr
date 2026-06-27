@@ -19,6 +19,15 @@ class Agent
       # The `cancel` callback returns true if the caller has requested cancellation.
       abstract def parse_stream(io : IO, response : Response, cancel : -> Bool) : {Message, Usage, String?}
 
+      # Build an HTTP request for the embeddings API.
+      # Returns the path (relative to the provider's base URI), headers,
+      # and the JSON body string.
+      abstract def build_embed_request(input : String, model : String) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
+
+      # Parse a non-streaming JSON response from the embeddings API.
+      # Returns the embedding vector and token usage.
+      abstract def parse_embed_response(io : IO) : {Array(Float64), Usage}
+
       # The base URI for the HTTP client (scheme, host, port, optional path prefix).
       abstract def base_uri : URI
 

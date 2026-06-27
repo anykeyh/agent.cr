@@ -113,6 +113,12 @@ describe Agent::ChainHandler do
     end
     result.should be(replacement)
   end
+
+  it "passes EmbedContext through and returns the block's vector" do
+    ctx = Agent::EmbedContext.new("hello", nil)
+    result = handler.decorate(ctx) { |_| [1.0, 2.0, 3.0] }
+    result.should eq([1.0, 2.0, 3.0])
+  end
 end
 
 # Verify that Response clears its chunk_handler on finish/finish_with_error

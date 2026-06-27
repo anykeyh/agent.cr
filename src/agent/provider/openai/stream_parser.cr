@@ -189,6 +189,23 @@ class Agent
           )
         end
       end
+
+      # Parses a non-streaming JSON response from the OpenAI embeddings API.
+      module EmbedResponseParser
+        extend self
+
+        def parse(io : IO) : {Array(Float64), Usage}
+          raw = JSON.parse(io)
+          root = raw.as_h? || raise Agent::Error.new("Embed response is not a JSON object")
+
+          data = root["data"]?.try(&.as_a?) || raise Agent::Error.new("Embed response missing 'data' array")
+          first = data.first?.try(&.as_h?) || raise Agent::Error.new("Embed response 'data' array is empty")
+          embedding = first["embedding"]?.try(&.as_a?) || raise Agent::Error.new("Embed response entry missing 'embedding'")
+
+          vector = embedding.map(&.as_f)
+          {vector, Usage.new}
+        end
+      end
     end
   end
 end

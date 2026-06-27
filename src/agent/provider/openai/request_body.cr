@@ -90,6 +90,19 @@ class Agent
           part.to_json_body
         end
       end
+
+      # Builds the JSON request body for the OpenAI embeddings API.
+      # `model` must be non-nil — the caller (Agent#embed) resolves the default.
+      module EmbedRequestBody
+        extend self
+
+        def build(input : String, model : String) : Hash(String, JSON::Any)
+          {
+            "input" => JSON::Any.new(input),
+            "model" => JSON::Any.new(model),
+          }
+        end
+      end
     end
   end
 end

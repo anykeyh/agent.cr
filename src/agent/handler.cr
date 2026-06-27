@@ -31,6 +31,16 @@ class Agent
     end
   end
 
+  # Mutable context for an embedding request.
+  # Handlers may mutate the input or model before the HTTP request is built.
+  class EmbedContext
+    property input : String
+    property model : String?
+
+    def initialize(@input, @model)
+    end
+  end
+
   # Mutable context for an exception that escaped the pipeline.
   # Handlers may wrap or replace the error before it's recorded.
   # `error` is typed `Exception` because the generic rescue branch can land
@@ -62,6 +72,10 @@ class Agent
     end
 
     def handle(ctx : ToolCallContext, next_proc : ToolCallContext -> Message) : Message
+      next_proc.call(ctx)
+    end
+
+    def handle(ctx : EmbedContext, next_proc : EmbedContext -> Array(Float64)) : Array(Float64)
       next_proc.call(ctx)
     end
 
@@ -104,6 +118,10 @@ class Agent
       build_tool_call(@chain.each, block).call(context)
     end
 
+    def decorate(context : EmbedContext, &block : EmbedContext -> Array(Float64)) : Array(Float64)
+      build_embed(@chain.each, block).call(context)
+    end
+
     def decorate(context : ErrorContext, &block : ErrorContext -> Agent::Error) : Agent::Error
       build_error(@chain.each, block).call(context)
     end
@@ -139,6 +157,16 @@ class Agent
       else
         rest = build_tool_call(iter, leaf)
         ->(ctx : ToolCallContext) { current.handle(ctx, rest) }
+      end
+    end
+
+    private def build_embed(iter, leaf : EmbedContext -> Array(Float64)) : EmbedContext -> Array(Float64)
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_embed(iter, leaf)
+        ->(ctx : EmbedContext) { current.handle(ctx, rest) }
       end
     end
 

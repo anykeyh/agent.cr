@@ -56,6 +56,14 @@ class Agent
           "#{base_path}/chat/completions"
         end
 
+        # The embeddings path derived from api_endpoint.
+        # Normalises duplicate slashes in the endpoint path (same as chat_path).
+        def embed_path : String
+          base_path = @parsed_uri.path.empty? || @parsed_uri.path == "/" ? "" : @parsed_uri.path.rstrip('/')
+          normalized = base_path.gsub(/\/+/, "/")
+          "#{normalized}/embeddings"
+        end
+
         private def validate_temperature(t : Float64?) : Nil
           if t && (t < 0.0 || t > 2.0)
             raise ArgumentError.new("temperature must be between 0.0 and 2.0, got #{t}")
@@ -136,6 +144,28 @@ class Agent
       # Parse an OpenAI SSE streaming response.
       def parse_stream(io : IO, response : Response, cancel : -> Bool) : {Message, Usage, String?}
         StreamParser.parse(io, response, cancel)
+      end
+
+      # Build an HTTP request for the OpenAI embeddings API.
+      def build_embed_request(input : String, model : String) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
+        body_hash = EmbedRequestBody.build(input, model)
+
+        headers = HTTP::Headers.new
+        if key = @config.api_key
+          headers["Authorization"] = "Bearer #{key}"
+        end
+        headers["Content-Type"] = "application/json"
+
+        if extra = @config.extra_headers
+          extra.each { |k, v| headers[k] = v }
+        end
+
+        {path: @config.embed_path, headers: headers, body: body_hash.to_json}
+      end
+
+      # Parse a non-streaming JSON response from the OpenAI embeddings API.
+      def parse_embed_response(io : IO) : {Array(Float64), Usage}
+        EmbedResponseParser.parse(io)
       end
 
       # Release any provider-owned resources (no-op for OpenAI).

@@ -195,6 +195,62 @@ class Agent
     raise ClosedError.new
   end
 
+  # Embed text using the provider's embeddings API and return the vector.
+  #
+  # This is a **synchronous** call that runs on the caller's fiber — it does
+  # not go through the agent fiber or the request channel. It makes a direct
+  # HTTP POST to the provider's embeddings endpoint.
+  #
+  # Raises Agent::ClosedError if the agent has been closed via #close.
+  # Raises Agent::ApiError on non-2xx status.
+  # Raises Agent::ConnectionError on network failures.
+  # Raises Agent::Error on JSON parse failures or unexpected response shape.
+  # Raises ArgumentError if no model is resolved (neither per-call nor config).
+  #
+  # ```
+  # vector = agent.embed("What is the meaning of life?")
+  # puts vector.size # => 1536
+  # ```
+  def embed(input : String, model : String? = nil) : Array(Float64)
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
+
+    @handlers.decorate(EmbedContext.new(input, model || @config.embed_model)) do |ctx|
+      resolved_model = ctx.model
+      raise ArgumentError.new("No model specified for embedding — set embed_model in config or pass model: argument") if resolved_model.nil?
+
+      req = @provider.build_embed_request(ctx.input, resolved_model)
+      client = @http_client
+
+      begin
+        result = nil
+
+        client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
+          unless http_resp.status.ok?
+            raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
+          end
+
+          vector, _usage = @provider.parse_embed_response(http_resp.body_io)
+          result = vector
+        end
+
+        # ameba:disable Lint/NotNil
+        result.not_nil!
+      rescue ex : ApiError
+        err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+        raise err
+      rescue ex : ConnectionError
+        raise ex
+      rescue ex
+        err = @handlers.decorate(ErrorContext.new(ex)) { |c|
+          ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
+        }
+        raise err
+      end
+    end
+  rescue Channel::ClosedError
+    raise ClosedError.new
+  end
+
   # Restore session state from previously dumped session data.
   #
   # This restores session_id, cache_key, conversation history, and enabled-tool

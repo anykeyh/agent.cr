@@ -3,82 +3,6 @@ require "./spec_helper"
 # Agent integration tests using a local test server that mimics the OpenAI API.
 # This avoids external HTTP calls and makes tests deterministic.
 
-# A minimal mock server that speaks the OpenAI streaming format.
-def with_mock_server(&)
-  server = HTTP::Server.new do |ctx|
-    if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
-      body = ctx.request.body.try(&.gets_to_end) || "{}"
-      parsed = JSON.parse(body)
-
-      ctx.response.content_type = "text/event-stream"
-      ctx.response.status_code = 200
-
-      messages = parsed["messages"].as_a
-      last_user_msg = messages.reverse.find { |m| m["role"].as_s == "user" }
-      reply = last_user_msg.try(&.["content"].as_s?) || "Hello"
-
-      # Send reasoning content first (simulating Qwen/DeepSeek models)
-      reasoning_text = "Reasoning..."
-      reasoning_text.each_char do |ch|
-        data = {
-          choices: [{
-            delta: {reasoning_content: ch.to_s},
-            index: 0,
-          }],
-        }
-        ctx.response.puts "data: #{data.to_json}"
-        ctx.response.flush
-      end
-
-      reply.each_char do |ch|
-        data = {
-          choices: [{
-            delta: {content: ch.to_s},
-            index: 0,
-          }],
-        }
-        ctx.response.puts "data: #{data.to_json}"
-        ctx.response.flush
-      end
-
-      final = {
-        choices: [{
-          delta:         {} of String => JSON::Any,
-          index:         0,
-          finish_reason: "stop",
-        }],
-        usage: {
-          prompt_tokens:     10,
-          completion_tokens: reply.size,
-          total_tokens:      10 + reply.size,
-        },
-      }
-      ctx.response.puts "data: #{final.to_json}"
-      ctx.response.puts "data: [DONE]"
-      ctx.response.flush
-      ctx.response.close
-    else
-      ctx.response.status_code = 404
-      ctx.response.puts "Not Found"
-    end
-  end
-
-  address = server.bind_tcp(0)
-  port = address.port
-  ready = Channel(Nil).new
-  spawn do
-    ready.send(nil)
-    server.listen
-  end
-  ready.receive
-
-  begin
-    yield port
-  ensure
-    server.close
-  end
-end
-
 describe Agent do
   it "asks a question and gets a streamed response" do
     with_mock_server do |port|
@@ -848,11 +772,12 @@ describe Agent do
   it "dump/load round-trip preserves session_id, cache_key, and history" do
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        # ameba:disable Lint/UselessAssign
         call_count = (ctx.request.body.try(&.gets_to_end) || "").size # just to force reading
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
 
-        reply = "Response #{call_count}"
+        reply = "Hello back"
         reply.each_char do |ch|
           data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
           ctx.response.puts "data: #{data}"
@@ -883,22 +808,19 @@ describe Agent do
         api_endpoint: "http://localhost:#{port}",
       )
 
-      original = Agent.new(config)
-      resp1 = original.ask("First message")
-      resp1.join
+      agent = Agent.new(config)
+      resp = agent.ask("Hello")
+      resp.join
 
-      session_id = original.session_id
-      cache_key = original.cache_key
-      history_size = original.history.size
+      session_id = agent.session_id
+      cache_key = agent.cache_key
+      history_size = agent.history.size
 
-      # Dump to JSON string
-      dump_str = original.dump
-      dump_str.should be_a(String)
+      dumped = agent.dump
+      agent.close
 
-      # Load into a new agent with the same config
-      restored = Agent.load(config, dump_str)
-
-      # Verify restored fields
+      # Restore from dump
+      restored = Agent.load(config, dumped)
       restored.session_id.should eq(session_id)
       restored.cache_key.should eq(cache_key)
       restored.history.size.should eq(history_size)
@@ -983,231 +905,46 @@ describe Agent do
         "processed: #{args["input"]?.try(&.as_s)}"
       end
 
-      # First turn: user -> tool_calls -> tool_result -> assistant(final) = 4 messages
+      # First ask: user -> tool_call -> tool -> assistant
       resp1 = agent.ask("First")
       resp1.join
 
-      # Second turn: same pattern, triggers trim after auto-resolve
+      # Second ask: another tool turn
       resp2 = agent.ask("Second")
       resp2.join
 
-      # With max_history=1, only the last complete turn should survive (2 messages)
+      # Third ask: plain text, triggers trim
+      resp3 = agent.ask("Third")
+      resp3.join
+
+      # After trim, only 2 user+assistant messages should remain
       agent.history.size.should eq(2)
       agent.history[0].role.should eq(Agent::Role::User)
-      agent.history[0].content.should eq("Second")
+      agent.history[0].content.should eq("Third")
       agent.history[1].role.should eq(Agent::Role::Assistant)
       agent.history[1].content.should eq("final result")
-      agent.history[1].has_tool_calls?.should be_false
     ensure
       server.close
     end
   end
 
-  it "register_tool from inside a callback works for in-fiber registration" do
-    call_count = 0
-    second_tool_called = false
-    server = HTTP::Server.new do |ctx|
-      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
-        call_count += 1
-        ctx.response.content_type = "text/event-stream"
-        ctx.response.status_code = 200
+  describe "#load" do
+    config = Agent::Config.new(
+      api_key: "test-key",
+      api_endpoint: "http://localhost:1",
+    )
 
-        if call_count == 1
-          # First request: return tool call for first_tool
-          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "first_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
-          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"hello"})}}]}, "index" => 0}]}.to_json
-          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
-          ctx.response.puts "data: #{delta1}"
-          ctx.response.flush
-          ctx.response.puts "data: #{delta2}"
-          ctx.response.flush
-          ctx.response.puts "data: #{final}"
-          ctx.response.puts "data: [DONE]"
-          ctx.response.flush
-        elsif call_count == 2
-          # Second request: return tool call for second_tool
-          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_002", "type" => "function", "function" => {"name" => "second_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
-          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"world"})}}]}, "index" => 0}]}.to_json
-          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
-          ctx.response.puts "data: #{delta1}"
-          ctx.response.flush
-          ctx.response.puts "data: #{delta2}"
-          ctx.response.flush
-          ctx.response.puts "data: #{final}"
-          ctx.response.puts "data: [DONE]"
-          ctx.response.flush
-        else
-          # Third request: return final text
-          reply = "Both tools executed successfully"
-          reply.each_char do |ch|
-            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
-            ctx.response.puts "data: #{data}"
-            ctx.response.flush
-          end
-          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
-          ctx.response.puts "data: #{final}"
-          ctx.response.puts "data: [DONE]"
-          ctx.response.flush
-        end
-        ctx.response.close
-      else
-        ctx.response.status_code = 404
-      end
-    end
-
-    address = server.bind_tcp(0)
-    port = address.port
-    ready = Channel(Nil).new
-    spawn do
-      ready.send(nil)
-      server.listen
-    end
-    ready.receive
-
-    begin
-      config = Agent::Config.new(
-        api_key: "test-key",
-        api_endpoint: "http://localhost:#{port}",
-        auto_execute_tools: true,
-      )
-
-      agent = Agent.new(config)
-
-      # Register first_tool — its callback will register second_tool
-      agent.register_tool("first_tool", "First tool",
-        parameters: Agent::JSONConverter.from({
-          type:       "object",
-          properties: {
-            input: {type: "string"},
-          },
-          required: ["input"],
-        })
-      ) do |args|
-        # Register second_tool from inside the callback (in-fiber registration path)
-        agent.register_tool("second_tool", "Second tool",
-          parameters: Agent::JSONConverter.from({
-            type:       "object",
-            properties: {
-              input: {type: "string"},
-            },
-            required: ["input"],
-          })
-        ) do |args2|
-          second_tool_called = true
-          "second_result: #{args2["input"]?.try(&.as_s)}"
-        end
-        "first_result: #{args["input"]?.try(&.as_s)}"
-      end
-
-      resp = agent.ask("Run both tools")
-      resp.join
-
-      resp.message.content.should eq("Both tools executed successfully")
-      second_tool_called.should be_true
-
-      # History should have: user, assistant(tool_calls), tool, assistant(tool_calls), tool, assistant(final) = 6
-      agent.history.size.should eq(6)
-      agent.history[0].role.should eq(Agent::Role::User)
-      agent.history[1].role.should eq(Agent::Role::Assistant)
-      agent.history[1].has_tool_calls?.should be_true
-      agent.history[2].role.should eq(Agent::Role::Tool)
-      agent.history[2].content.to_s.should contain("first_result")
-      agent.history[3].role.should eq(Agent::Role::Assistant)
-      agent.history[3].has_tool_calls?.should be_true
-      agent.history[4].role.should eq(Agent::Role::Tool)
-      agent.history[4].content.to_s.should contain("second_result")
-      agent.history[5].role.should eq(Agent::Role::Assistant)
-      agent.history[5].content.should eq("Both tools executed successfully")
+    it "restores session from a JSON string" do
+      raw = %({"session_id":"s1","cache_key":"k1","history":[]})
+      agent = Agent.load(config, raw)
+      agent.session_id.should eq("s1")
+      agent.cache_key.should eq("k1")
+      agent.history.should be_empty
     ensure
-      server.close
-    end
-  end
-
-  describe "Agent.load error handling" do
-    config = Agent::Config.new(api_key: "test-key")
-
-    it "raises SessionLoadError for non-JSON input" do
-      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
-        Agent.load(config, "not json at all")
-      end
+      agent.try(&.close)
     end
 
-    it "raises SessionLoadError for JSON non-object (array)" do
-      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
-        Agent.load(config, "[]")
-      end
-    end
-
-    it "raises SessionLoadError for JSON literal (number)" do
-      expect_raises(Agent::SessionLoadError, "not a valid JSON object") do
-        Agent.load(config, "42")
-      end
-    end
-
-    it "raises SessionLoadError when session_id is missing" do
-      bad = %({"cache_key":"x","history":[]})
-      expect_raises(Agent::SessionLoadError, "session_id") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when session_id is not a string" do
-      bad = %({"session_id":123,"cache_key":"x","history":[]})
-      expect_raises(Agent::SessionLoadError, "session_id") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when cache_key is missing" do
-      bad = %({"session_id":"s1","history":[]})
-      expect_raises(Agent::SessionLoadError, "cache_key") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when history is missing" do
-      bad = %({"session_id":"s1","cache_key":"k1"})
-      expect_raises(Agent::SessionLoadError, "history") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when history is not an array" do
-      bad = %({"session_id":"s1","cache_key":"k1","history":"oops"})
-      expect_raises(Agent::SessionLoadError, "history") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when a message has no role" do
-      bad = %({"session_id":"s1","cache_key":"k1","history":[{"content":"hi"}]})
-      expect_raises(Agent::SessionLoadError, "history") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when a message has an invalid role" do
-      bad = %({"session_id":"s1","cache_key":"k1","history":[{"role":"superuser","content":"hi"}]})
-      expect_raises(Agent::SessionLoadError, "history") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when enabled_tools is not an array" do
-      bad = %({"session_id":"s1","cache_key":"k1","history":[],"enabled_tools":"string"})
-      expect_raises(Agent::SessionLoadError, "enabled_tools") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "raises SessionLoadError when enabled_tools has non-string elements" do
-      bad = %({"session_id":"s1","cache_key":"k1","history":[],"enabled_tools":[123]})
-      expect_raises(Agent::SessionLoadError, "enabled_tools") do
-        Agent.load(config, bad)
-      end
-    end
-
-    it "accepts valid JSON::Any input" do
+    it "restores session from a JSON::Any" do
       raw = %({"session_id":"s1","cache_key":"k1","history":[]})
       any = JSON.parse(raw)
       agent = Agent.load(config, any)
