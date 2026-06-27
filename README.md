@@ -294,6 +294,84 @@ Then pass it to `#ask`: `agent.ask("...", tools: [weather_tool])` — see the ma
 
 ---
 
+## Handler chain
+
+`agent-cr` provides a middleware-style handler chain that wraps every stage of the request pipeline. Handlers can inspect, mutate, or short-circuit requests before they reach the API, and responses before they reach your code.
+
+### Architecture
+
+Four context types correspond to the four pipeline stages. A `Handler` subclass overrides the `handle` overloads it cares about; each receives the context and a `next_proc` that invokes the rest of the chain:
+
+| Context | Stage | Attack surface |
+|---|---|---|
+| `TurnContext` | Before the HTTP request is built | Mutate `ctx.messages` and `ctx.tools` before they're sent to the model |
+| `ChunkContext` | Each streamed SSE delta | Replace `ctx.chunk` to rewrite tokens in-flight |
+| `ToolCallContext` | Before a tool callback is executed | Approve/deny tool execution, cancel the response |
+| `ErrorContext` | After an exception escapes the pipeline | Wrap or replace the error before it's recorded |
+
+### Writing a handler
+
+```crystal
+class LoggingHandler < Agent::Handler
+  # Override only the stages you care about — the default is a pass-through.
+  def handle(ctx : Agent::TurnContext, next_proc) : {Agent::Message, Agent::Usage, String?}
+    puts "Sending #{ctx.messages.size} messages..."
+    result = next_proc.call(ctx)
+    puts "Received response."
+    result
+  end
+end
+```
+
+> **Mutation rules:** `Chunk` is a class; reassign `ctx.chunk = Chunk.new(...)` to rewrite chunks. `Message` is immutable; replace entries in `ctx.messages` with new `Message` objects to rewrite user input.
+
+### Registration
+
+Append handlers with `agent.use`. Handlers run left-to-right in registration order — the first handler registered wraps the outermost layer:
+
+```crystal
+agent.use(LoggingHandler.new)
+agent.use(TokenBudgetHandler.new)
+```
+
+### Short-circuiting
+
+A handler can prevent the rest of the chain from running by returning a value without calling `next_proc`. This is useful for gating tool calls, denying requests, or serving cached responses:
+
+```crystal
+class GateKeeper < Agent::Handler
+  def handle(ctx : Agent::ToolCallContext, next_proc) : Agent::Message
+    if ctx.tool_call.name == "dangerous_op"
+      Agent::Message.new(
+        role: Agent::Role::Tool,
+        content: "Tool '#{ctx.tool_call.name}' denied by policy.",
+        tool_call_id: ctx.tool_call.id,
+        name: ctx.tool_call.name,
+      )
+    else
+      next_proc.call(ctx)
+    end
+  end
+end
+```
+
+### Example
+
+See `examples/handlers.cr` for a working CLI that demonstrates four handlers:
+
+| Handler | Context | What it does |
+|---|---|---|
+| `TokenBudgetHandler` | `TurnContext` | Times the turn, prints `tok/s`, enforces a session token budget |
+| `WordReplaceHandler` | `TurnContext` + `ChunkContext` | Rewrites words on both sides of the conversation (`hello` → `howdy`, `world` → `galaxy`) |
+| `ToolConfirmHandler` | `ToolCallContext` | Prompts the user before executing tools; short-circuits on decline |
+| `ErrorRetryHandler` | `ErrorContext` | Colorizes errors by type |
+
+```sh
+crystal run examples/handlers.cr
+```
+
+---
+
 ## Provider system
 
 `agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, OpenRouter, Anthropic via proxy, local llama.cpp, Ollama, etc.).
