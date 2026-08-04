@@ -439,25 +439,9 @@ class Agent
     loop do
       iteration += 1
 
-      # If the agent was closed during tool execution, bail out.
-      if @state_mutex.synchronize { @closed }
-        err = Agent::Error.new("Agent was closed")
-        response.finish_with_error(err)
-        break
-      end
-
-      # If the caller cancelled during tool execution, bail out.
-      if response.cancelled?
-        err = CancelledError.new
-        response.finish_with_error(err)
-        break
-      end
-
-      # Bail out if the model is stuck in a tool-call loop.
-      if max_iter && iteration > max_iter
-        err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
-        err = ToolLoopError.new(max_iter, err_msg)
-        response.finish_with_error(err)
+      # Pre-flight bail-out checks (closed / cancelled / iteration limit).
+      # Returns true if the loop should break.
+      if preflight_bailout?(response, iteration, max_iter)
         break
       end
 
@@ -466,9 +450,18 @@ class Agent
       }
       msg, usage, finish_reason = http_post_stream(messages, tools, response)
 
-      # On error, http_post_stream already called response.finish/finish_with_error.
-      # Roll back the user messages that were appended at the start of this
-      # request so history is not corrupted for subsequent #ask calls.
+      # Cancellation is a user-initiated abort, not a failure: the partial
+      # assistant reply and the user's messages are real conversation context
+      # and must be preserved so the next #ask has continuity.
+      if response.cancelled?
+        handle_cancellation(msg, response)
+        break
+      end
+
+      # On a genuine error (network/API/JSON), http_post_stream already called
+      # response.finish_with_error. Roll back the user messages that were
+      # appended at the start of this request so history is not corrupted for
+      # subsequent #ask calls (the turn never produced a usable assistant reply).
       if response.error?
         @history.lock { |h| request.new_messages.each { h.pop } }
         break
@@ -507,6 +500,42 @@ class Agent
       history_snapshot = @history.lock(&.dup)
       messages = build_messages(history_snapshot, [] of Message)
     end
+  end
+
+  # Preserve the canceled turn in history.
+  #
+  # Cancellation is a user-initiated abort, not a failure: whatever assistant
+  # content was streamed before the cancel is real conversation context and is
+  # appended to history so the next #ask has continuity (the user's question
+  # was already appended at the start of #process_request_loop and is kept).
+  # The response is then finished with a CancelledError.
+  private def handle_cancellation(partial_msg : Message, response : Response) : Nil
+    has_content = !partial_msg.content.nil? || !partial_msg.tool_calls.nil?
+    @history.lock { |h| h << partial_msg } if has_content
+    trim_history!
+    response.finish_with_error(CancelledError.new)
+  end
+
+  # Checks performed at the top of each tool-resolution iteration.
+  # Returns true (and finishes the response) if the loop should break.
+  private def preflight_bailout?(response : Response, iteration : Int32, max_iter : Int32?) : Bool
+    if @state_mutex.synchronize { @closed }
+      response.finish_with_error(Agent::Error.new("Agent was closed"))
+      return true
+    end
+
+    if response.cancelled?
+      response.finish_with_error(CancelledError.new)
+      return true
+    end
+
+    if max_iter && iteration > max_iter
+      err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
+      response.finish_with_error(ToolLoopError.new(max_iter, err_msg))
+      return true
+    end
+
+    false
   end
 
   # Trim history to respect max_history config, applied only after a
@@ -725,6 +754,7 @@ class Agent
       client = @http_client
 
       begin
+        partial_msg = nil
         client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
           unless http_resp.status.ok?
             raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
@@ -737,7 +767,10 @@ class Agent
           )
 
           # If the response was cancelled mid-stream, treat it as an error.
+          # Keep the partial assistant message so the caller can preserve it
+          # in history, and raise to abort the HTTP block.
           if response.cancelled?
+            partial_msg = msg
             raise CancelledError.new
           end
 
@@ -748,9 +781,16 @@ class Agent
         response.finish_with_error(err)
         {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
       rescue ex : CancelledError
+        # Cancellation leaves the persistent HTTP connection with an
+        # unconsumed/partial response body, which would corrupt the next
+        # request on the same client ("Invalid HTTP response"). Discard the
+        # connection and build a fresh one for subsequent requests.
+        rebuild_http_client
         err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
         response.finish_with_error(err)
-        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
+        # Return the partial message assembled before cancellation (may be
+        # empty if nothing was streamed). The caller decides whether to keep it.
+        {partial_msg || Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
       rescue ex
         err = @handlers.decorate(ErrorContext.new(ex)) { |c|
           ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
@@ -773,5 +813,16 @@ class Agent
     end
 
     client
+  end
+
+  # Replace the persistent HTTP client with a fresh one.
+  # Used after a cancelled stream leaves the previous connection with an
+  # unconsumed response body, which would corrupt the next request.
+  private def rebuild_http_client : Nil
+    @http_client.close
+  rescue IO::Error
+    # ignore close errors on a possibly-broken socket
+  ensure
+    @http_client = build_http_client
   end
 end

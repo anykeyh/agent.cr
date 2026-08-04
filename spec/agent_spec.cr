@@ -262,6 +262,7 @@ describe Agent do
 
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
 
@@ -328,6 +329,9 @@ describe Agent do
     call_count = 0
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        # Drain the request body so keep-alive framing stays valid for the
+        # next request on the same pooled connection.
+        ctx.request.body.try(&.gets_to_end)
         call_count += 1
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
@@ -424,6 +428,7 @@ describe Agent do
     call_count = 0
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
         call_count += 1
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
@@ -538,6 +543,7 @@ describe Agent do
     call_count = 0
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
         call_count += 1
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
@@ -636,6 +642,7 @@ describe Agent do
       call_count = 0
       server = HTTP::Server.new do |ctx|
         if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+          ctx.request.body.try(&.gets_to_end)
           call_count += 1
           ctx.response.content_type = "text/event-stream"
           ctx.response.status_code = 200
@@ -784,6 +791,93 @@ describe Agent do
     end
   end
 
+  it "preserves the canceled turn in history after cancellation" do
+    # A mock server that streams content slowly enough to be canceled mid-flight.
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        reply = call_count == 1 ? "Partial reply" : "Second reply"
+        reply.each_char do |ch|
+          data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+          ctx.response.puts "data: #{data}"
+          ctx.response.flush
+          # Yield between chunks so the caller can cancel mid-stream.
+          Fiber.yield
+        end
+        final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => reply.size, "total_tokens" => 10 + reply.size}}.to_json
+        ctx.response.puts "data: #{final}"
+        ctx.response.puts "data: [DONE]"
+        ctx.response.flush
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+      )
+
+      agent = Agent.new(config)
+
+      # --- Turn 1: ask, stream a few chunks, then cancel mid-flight ---
+      resp1 = agent.ask("Question 1")
+      chunks = [] of String
+      resp1.stream do |chunk|
+        chunks << chunk.text if chunk.content?
+        # After receiving a couple of chunks, cancel the in-flight stream.
+        if chunks.size >= 2
+          resp1.cancel
+        end
+      end
+      resp1.join
+      resp1.error?.should be_true
+      resp1.error.should be_a(Agent::CancelledError)
+      chunks.should_not be_empty
+
+      # --- Turn 2: ask a follow-up question that completes normally ---
+      resp2 = agent.ask("Question 2")
+      resp2.stream { |_| } # drain
+      resp2.join
+      resp2.finished?.should be_true
+      resp2.error?.should be_false, "second request failed after cancel: #{resp2.error.try(&.message)}"
+
+      # --- Expectation: the canceled turn must NOT be lost from history ---
+      # History should contain, at minimum:
+      #   user("Question 1")           <- the canceled user message
+      #   assistant(partial content)   <- whatever was streamed before cancel
+      #   user("Question 2")
+      #   assistant("Second reply")
+      history = agent.history
+      history.size.should be >= 4
+      history[0].role.should eq(Agent::Role::User)
+      history[0].content.should eq("Question 1")
+      history[1].role.should eq(Agent::Role::Assistant)
+      history[2].role.should eq(Agent::Role::User)
+      history[2].content.should eq("Question 2")
+      history[3].role.should eq(Agent::Role::Assistant)
+      history[3].content.should eq("Second reply")
+    ensure
+      server.close
+    end
+  end
+
   describe "#close" do
     it "prevents further #ask calls" do
       with_mock_server do |port|
@@ -917,6 +1011,7 @@ describe Agent do
     call_count = 0
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
         call_count += 1
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
@@ -1008,6 +1103,7 @@ describe Agent do
     second_tool_called = false
     server = HTTP::Server.new do |ctx|
       if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
         call_count += 1
         ctx.response.content_type = "text/event-stream"
         ctx.response.status_code = 200
