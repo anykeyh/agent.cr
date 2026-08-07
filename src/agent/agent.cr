@@ -39,6 +39,10 @@ class Agent
 
   # Persistent HTTP client for connection pooling across requests.
   @http_client : HTTP::Client
+  # The per-read timeout value that was last applied to @http_client's socket at
+  # open time. Used by #apply_client_read_timeout to decide whether the client
+  # must be rebuilt so a new timeout value actually takes effect on the socket.
+  @applied_read_timeout : Time::Span?
   # The provider handles all wire-format concerns.
   @provider : Provider::Base
   # Chain of handler decorators.
@@ -54,6 +58,7 @@ class Agent
     )
     @state_mutex = Sync::Mutex.new
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
+    @applied_read_timeout = nil
     @http_client = build_http_client
     @handlers = ChainHandler.new
     @fiber = spawn { run_loop }
@@ -743,6 +748,13 @@ class Agent
 
   # Perform the HTTP POST to the provider and parse the streaming response.
   # This is a thin shim that delegates to the provider for wire-format concerns.
+  #
+  # Per-read SSE timeouts (first-byte vs idle) come from `Agent::Config` and
+  # are applied both to the HTTP client (so the underlying socket honours them)
+  # and threaded through to `Provider#parse_stream` (which can re-apply per
+  # read). `IO::TimeoutError` and `IdleTimeoutError` are caught here and surface
+  # as `Agent::IdleTimeoutError` via the response's error path, mirroring the
+  # `CancelledError` recovery (rebuild the connection, keep the partial msg).
   private def http_post_stream(
     messages : Array(Message),
     tools : Array(Tool)?,
@@ -751,10 +763,12 @@ class Agent
     @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
       all_tools = combined_tools(ctx.tools)
       req = @provider.build_request(ctx.messages, all_tools)
+
+      first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
       client = @http_client
+      partial_msg = nil
 
       begin
-        partial_msg = nil
         client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
           unless http_resp.status.ok?
             raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
@@ -764,6 +778,8 @@ class Agent
             http_resp.body_io,
             response,
             -> { response.cancelled? },
+            first_byte_timeout: first_byte_timeout,
+            idle_timeout: idle_timeout,
           )
 
           # If the response was cancelled mid-stream, treat it as an error.
@@ -776,43 +792,140 @@ class Agent
 
           {msg, usage, finish_reason}
         end
-      rescue ex : ApiError
-        err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-        response.finish_with_error(err)
-        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
-      rescue ex : CancelledError
-        # Cancellation leaves the persistent HTTP connection with an
-        # unconsumed/partial response body, which would corrupt the next
-        # request on the same client ("Invalid HTTP response"). Discard the
-        # connection and build a fresh one for subsequent requests.
-        rebuild_http_client
-        err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-        response.finish_with_error(err)
-        # Return the partial message assembled before cancellation (may be
-        # empty if nothing was streamed). The caller decides whether to keep it.
-        {partial_msg || Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
       rescue ex
-        err = @handlers.decorate(ErrorContext.new(ex)) { |c|
-          ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
-        }
-        response.finish_with_error(err)
-        {Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}"), Usage.new, nil}
+        handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout)
       end
     end
+  end
+
+  # Centralised error handler for #http_post_stream. Dispatches on the
+  # exception type, decorates it through the handler chain, calls
+  # `response.finish_with_error`, and returns the canonical error tuple to the
+  # caller (preserving any partial assistant message captured before the
+  # failure). Active connections are rebuilt after cancellation / timeout /
+  # mid-line read failures because the socket may be in an unknown state.
+  private def handle_post_error(
+    ex : Exception,
+    response : Response,
+    partial_msg : Message?,
+    first_byte_timeout : Time::Span?,
+    idle_timeout : Time::Span,
+  ) : {Message, Usage, String?}
+    case ex
+    when ApiError
+      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+      response.finish_with_error(err)
+      error_tuple(err)
+    when CancelledError, IdleTimeoutError
+      # Cancellation / per-read SSE timeout was already wrapped by the parser
+      # for the idle case, or raised here directly for cancellation. Either
+      # leaves the persistent HTTP connection with an unconsumed/partial
+      # response body, which would corrupt the next request on the same client
+      # ("Invalid HTTP response"). Discard and build a fresh one.
+      rebuild_http_client
+      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+      response.finish_with_error(err)
+      error_tuple(err, partial_msg)
+    when IO::TimeoutError
+      # Defensive fallback: the parser wraps its IO reads and raises
+      # IdleTimeoutError directly, but other IO operations in this shim (eg.
+      # request body upload) might still raise IO::TimeoutError. Recover the
+      # same way as IdleTimeoutError with phase inferred from partial_msg.
+      rebuild_http_client
+      phase = partial_msg.nil? ? :first_byte : :idle
+      err = @handlers.decorate(ErrorContext.new(ex)) do |c|
+        IdleTimeoutError.new(phase, first_byte_timeout || idle_timeout, cause: c.error)
+      end
+      response.finish_with_error(err)
+      error_tuple(err, partial_msg)
+    else
+      err = @handlers.decorate(ErrorContext.new(ex)) { |c|
+        ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
+      }
+      response.finish_with_error(err)
+      error_tuple(err)
+    end
+  end
+
+  # Compute the per-request SSE read timeouts from `Agent::Config` and apply
+  # them to the persistent HTTP client. Returns the {first_byte, idle} timeouts
+  # to thread through to the provider's `#parse_stream`.
+  #
+  # `prompt_bytes` is the size of the wire-format request body; the first-byte
+  # budget scales with prompt size per AGENTS.md. When dynamic first-byte is
+  # disabled (`compute_first_byte_timeout? == false`), `first_byte` is nil and
+  # both reads fall back to `idle_byte_timeout`.
+  #
+  # The HTTP client's `read_timeout` is set to `Config#effective_read_timeout`
+  # (the smaller of first_byte_timeout and idle_byte_timeout on a real
+  # connection), because HTTP::Client only honours `read_timeout` at
+  # socket-open time — there's no portable way to mutate the per-read timeout
+  # mid-stream on `http_resp.body_io`. The provider's `parse_stream` re-applies
+  # per-read timeouts on the body_io when it supports `read_timeout=` (a no-op
+  # for HTTP::ChunkedContent) so the first-byte-generous-then-idle-tight
+  # switch is honored on IOs that surface the setter.
+  #
+  # Also: rebuild the client when the desired value changes so the new value
+  # sticks on a fresh socket (pooled connections don't pick up a new
+  # `client.read_timeout` after open).
+  private def apply_request_timeouts(prompt_bytes : Int) : {Time::Span?, Time::Span}
+    first_byte_timeout = @config.compute_first_byte_timeout(prompt_bytes)
+    idle_timeout = @config.idle_byte_timeout
+    desired_rt = @config.effective_read_timeout(prompt_bytes)
+    if desired_rt && desired_rt != @applied_read_timeout
+      apply_client_read_timeout(desired_rt)
+    end
+    {first_byte_timeout, idle_timeout}
+  end
+
+  # Build the canonical error return tuple for #http_post_stream: an assistant
+  # message whose content is the prefix-decorated error message, plus empty
+  # usage and nil finish_reason. If `partial` is provided (e.g. a partial
+  # assistant message captured before cancellation / timeout), it is
+  # preserved so the caller can keep any streamed tokens in history.
+  private def error_tuple(err : Agent::Error, partial : Message? = nil) : {Message, Usage, String?}
+    msg = partial || Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}")
+    {msg, Usage.new, nil}
   end
 
   private def build_http_client : HTTP::Client
     uri = @provider.base_uri
     client = HTTP::Client.new(uri)
 
+    # The legacy read_timeout from config (defaults to nil). When callers do
+    # not set it explicitly, it remains nil and the dynamic per-read SSE
+    # timeouts (set in #http_post_stream via #apply_client_read_timeout) take
+    # over. If both are set, apply_client_read_timeout overrides this on the
+    # first request whose dynamic timeout differs.
     if (rt = @config.read_timeout) && rt > Time::Span.zero
       client.read_timeout = rt
+      @applied_read_timeout = rt
+    else
+      @applied_read_timeout = nil
     end
     if (ct = @config.connect_timeout) && ct > Time::Span.zero
       client.connect_timeout = ct
     end
 
     client
+  end
+
+  # Apply a per-read timeout to the persistent HTTP client. Because the
+  # underlying socket only honours `read_timeout` at open time, a value change
+  # requires rebuilding the client so the next POST opens a fresh socket with
+  # the new budget. The parser (StreamParser.parse) additionally re-applies
+  # `read_timeout=` to the body_io per successful read on IOs that support it
+  # (true sockets); this handles the first-byte → idle timeout switch.
+  private def apply_client_read_timeout(timeout : Time::Span) : Nil
+    return unless timeout > Time::Span.zero
+    @http_client.read_timeout = timeout
+    # If the timeout differs from what was applied at socket open, rebuild so
+    # the new value sticks on a fresh connection.
+    if timeout != @applied_read_timeout
+      rebuild_http_client
+      @http_client.read_timeout = timeout
+      @applied_read_timeout = timeout
+    end
   end
 
   # Replace the persistent HTTP client with a fresh one.

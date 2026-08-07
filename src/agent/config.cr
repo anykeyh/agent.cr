@@ -18,6 +18,27 @@ class Agent
     # "agent-cr:<16-char-hex>" from its own session_id.
     getter prompt_cache_key : String?
 
+    # --- Per-read SSE timeout knobs ---
+    # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
+    # All are applied to the persistent HTTP client's per-read socket timeout.
+    # `read_timeout` (above) is the legacy total-read timeout; if both are set,
+    # the dynamic first-byte / idle timeouts win for SSE streaming.
+
+    # Floor for the first-byte (TTFT) timeout. Small prompts that emit nothing
+    # for this long are considered dead.
+    getter first_byte_timeout_min : Time::Span
+    # Cap for the first-byte timeout — fail-fast ceiling even for huge prompts.
+    getter first_byte_timeout_max : Time::Span
+    # Routing + provider queue baseline added to the prompt-size estimate.
+    getter first_byte_timeout_base : Time::Span
+    # ms added per estimated input token (4 chars/token estimate).
+    getter first_byte_timeout_ms_per_token : Int32
+    # Gap allowed between any two consecutive lines mid-stream.
+    getter idle_byte_timeout : Time::Span
+    # Master switch — `false` disables dynamic first-byte; both the first
+    # read and subsequent reads fall back to `idle_byte_timeout`.
+    getter? compute_first_byte_timeout : Bool
+
     # Cached parsed URI — computed once at construction.
     getter parsed_uri : URI
 
@@ -35,6 +56,13 @@ class Agent
       @extra_headers : Hash(String, String)? = nil,
       @max_tool_iterations : Int32? = 100,
       @prompt_cache_key : String? = nil,
+      *,
+      first_byte_timeout_min : Time::Span | Int32 = 60,
+      first_byte_timeout_max : Time::Span | Int32 = 300,
+      first_byte_timeout_base : Time::Span | Int32 = 3,
+      @first_byte_timeout_ms_per_token : Int32 = 3,
+      idle_byte_timeout : Time::Span | Int32 = 60,
+      @compute_first_byte_timeout : Bool = true,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)
@@ -44,6 +72,14 @@ class Agent
       # Accept Int32 seconds for timeouts (convenience)
       @read_timeout = parse_timeout(read_timeout)
       @connect_timeout = parse_timeout(connect_timeout)
+
+      # SSE per-read timeouts. Same Int32-or-Span convenience as the legacy
+      # timeouts above.
+      @first_byte_timeout_min = parse_timeout(first_byte_timeout_min) || 60.seconds
+      @first_byte_timeout_max = parse_timeout(first_byte_timeout_max) || 300.seconds
+      @first_byte_timeout_base = parse_timeout(first_byte_timeout_base) || 3.seconds
+      @idle_byte_timeout = parse_timeout(idle_byte_timeout) || 60.seconds
+      validate_first_byte_timeout_bounds
 
       # Validate and parse the endpoint URI
       @parsed_uri = URI.parse(@api_endpoint)
@@ -84,6 +120,61 @@ class Agent
       when Time::Span then timeout
       else                 nil
       end
+    end
+
+    private def validate_first_byte_timeout_bounds : Nil
+      if @first_byte_timeout_min < Time::Span.zero
+        raise ArgumentError.new("first_byte_timeout_min must be non-negative, got #{@first_byte_timeout_min}")
+      end
+      if @first_byte_timeout_max < @first_byte_timeout_min
+        raise ArgumentError.new("first_byte_timeout_max (#{@first_byte_timeout_max}) must be >= first_byte_timeout_min (#{@first_byte_timeout_min})")
+      end
+      if @first_byte_timeout_base < Time::Span.zero
+        raise ArgumentError.new("first_byte_timeout_base must be non-negative, got #{@first_byte_timeout_base}")
+      end
+      if @first_byte_timeout_ms_per_token < 0
+        raise ArgumentError.new("first_byte_timeout_ms_per_token must be non-negative, got #{@first_byte_timeout_ms_per_token}")
+      end
+      if @idle_byte_timeout < Time::Span.zero
+        raise ArgumentError.new("idle_byte_timeout must be non-negative, got #{@idle_byte_timeout}")
+      end
+    end
+
+    # Compute the first-byte (TTFT) read timeout for a request whose wire
+    # body is `prompt_bytes` long. Returns nil if dynamic first-byte timeouts
+    # are disabled (`compute_first_byte_timeout? == false`) — callers should
+    # fall back to `idle_byte_timeout` in that case.
+    #
+    # Formula (AGENTS.md):
+    #   estimated_tokens = prompt_bytes / 4
+    #   timeout = clamp(base + estimated_tokens * ms_per_token, min, max)
+    def compute_first_byte_timeout(prompt_bytes : Int) : Time::Span?
+      return nil unless @compute_first_byte_timeout
+      estimated_tokens = (prompt_bytes.to_i64 / 4)
+      timeout_ms = @first_byte_timeout_base.total_milliseconds.to_i64 +
+                   estimated_tokens * @first_byte_timeout_ms_per_token.to_i64
+      timeout = timeout_ms.milliseconds
+      timeout.clamp(@first_byte_timeout_min, @first_byte_timeout_max)
+    end
+
+    # The per-read timeout actually applied to the HTTP client for a request
+    # with the given prompt body size. When dynamic first-byte is disabled,
+    # both the first read and subsequent reads use `idle_byte_timeout`.
+    #
+    # When dynamic first-byte is enabled, the *client*'s `read_timeout` is set to
+    # the **smaller** of (first_byte_timeout, idle_byte_timeout). HTTP::Client
+    # only honours `read_timeout` at socket-open time and there is no portable
+    # way to mutate the per-read timeout mid-stream on `http_resp.body_io`
+    # (HTTP::ChunkedContent does not surface `read_timeout=`). Taking the min
+    # means idle fail-fast on a hung TTFT is preserved (idle budget wins), and
+    # mid-stream stalls honour `idle_byte_timeout`. The provider's `parse_stream`
+    # additionally re-applies `read_timeout=` to the body_io per successful read
+    # when the IO supports it (true socket IOs that surface the setter), which
+    # restores the first-byte-generous-then-idle-tight switch for those IOs.
+    def effective_read_timeout(prompt_bytes : Int) : Time::Span?
+      fb = compute_first_byte_timeout(prompt_bytes)
+      return @idle_byte_timeout unless fb
+      fb < @idle_byte_timeout ? fb : @idle_byte_timeout
     end
 
     # The chat completions path derived from api_endpoint.

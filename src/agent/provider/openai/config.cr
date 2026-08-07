@@ -134,8 +134,16 @@ class Agent
       end
 
       # Parse an OpenAI SSE streaming response.
-      def parse_stream(io : IO, response : Response, cancel : -> Bool) : {Message, Usage, String?}
-        StreamParser.parse(io, response, cancel)
+      def parse_stream(
+        io : IO,
+        response : Response,
+        cancel : -> Bool,
+        first_byte_timeout : Time::Span? = nil,
+        idle_timeout : Time::Span? = nil,
+      ) : {Message, Usage, String?}
+        StreamParser.parse(io, response, cancel,
+          first_byte_timeout: first_byte_timeout,
+          idle_timeout: idle_timeout)
       end
 
       # Release any provider-owned resources (no-op for OpenAI).

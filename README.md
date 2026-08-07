@@ -462,7 +462,44 @@ Agent::Config.new(
   extra_headers:      Hash(String, String)?, # optional extra HTTP headers
   max_tool_iterations: Int32?,             # default: 100 — safety limit for tool loops
   prompt_cache_key:   String?,             # optional explicit prompt cache key
+  *,
+  # Per-read SSE timeouts (fail-fast on hung connections):
+  first_byte_timeout_min:          Time::Span | Int32 = 60,  # TTFT floor (seconds or span)
+  first_byte_timeout_max:          Time::Span | Int32 = 300, # TTFT ceiling
+  first_byte_timeout_base:          Time::Span | Int32 = 3,   # routing + provider queue baseline
+  first_byte_timeout_ms_per_token:  Int32 = 3,                # ms added per estimated input token (~4 chars/token)
+  idle_byte_timeout:                Time::Span | Int32 = 60,  # gap allowed between any two consecutive SSE lines
+  compute_first_byte_timeout:       Bool = true,              # false → dynamic first-byte disabled, both phases use idle_byte_timeout
 )
+```
+
+#### Per-read SSE timeouts (fail-fast on hung streams)
+
+The HTTP client's `read_timeout` is per-read: as long as *each* SSE line
+arrives within the idle budget, long-lived streams run unbounded. Two
+budgets are enforced independently:
+
+- **First-byte** (`compute_first_byte_timeout`): scales with prompt size so
+  short prompts fail fast (60s floor) while huge prompts get a generous
+  time-to-first-token budget (300s ceiling). Formula:
+  `clamp(base + (prompt_bytes / 4) * ms_per_token, min, max)`.
+- **Inter-byte (idle)**: 60s fixed by default — gap allowed between any two
+  consecutive lines mid-stream. Any byte arrival (comment lines like
+  `: OPENROUTER PROCESSING`, empty lines, the `[DONE]` sentinel) resets it.
+
+When the dynamic first-byte is disabled (`compute_first_byte_timeout: false`),
+both the first read and subsequent reads fall back to `idle_byte_timeout`.
+
+```crystal
+config = Agent::Config.new(
+  api_key: ENV["OPENAI_API_KEY"],
+  # Tighter fail-fast: 10s first byte, 5s inter-line gap
+  first_byte_timeout_min: 10.seconds,
+  first_byte_timeout_max: 60.seconds,
+  idle_byte_timeout: 5.seconds,
+)
+# → any prompt that emits nothing for 10s, or any mid-stream 5s stall,
+#   raises Agent::IdleTimeoutError without further retries.
 ```
 
 ---
@@ -490,6 +527,7 @@ Error types:
 | `Agent::ApiError` | API returned a non-2xx status code (includes `.status_code`) |
 | `Agent::ConnectionError` | Network / connection failure |
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
+| `Agent::IdleTimeoutError` | Provider stream stuck — no bytes within the first-byte or idle per-read timeout (`phase = :first_byte` or `:idle`, `timeout = Time::Span`) |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |
 | `Agent::SessionLoadError` | Loading a saved session failed due to corrupt or missing fields |
 | `Agent::ClosedError` | An operation was attempted on a closed agent |
@@ -500,15 +538,26 @@ Error types:
 
 ### Timeouts
 
-Set timeouts in production — the defaults are unbounded:
+Set timeouts in production — the defaults for the legacy `read_timeout` /
+`connect_timeout` are unbounded (nil). The per-read SSE timeouts `first_byte_timeout_*` /
+`idle_byte_timeout` have safe defaults (60s idle / 60s first-byte floor) and take
+precedence over `read_timeout` for streaming requests:
 
 ```crystal
 config = Agent::Config.new(
   api_key: ENV["OPENAI_API_KEY"],
-  read_timeout: 30.seconds,
-  connect_timeout: 10.seconds,
+  connect_timeout: 10.seconds,         # connect budget (total)
+  # Streaming SSE timeouts (per-read, NOT total-time):
+  first_byte_timeout_min: 60.seconds,  # floor on TTFT budget
+  first_byte_timeout_max: 300.seconds, # ceiling even for huge prompts
+  idle_byte_timeout: 60.seconds,       # gap allowed between two consecutive SSE lines
 )
 ```
+
+If a provider stream stalls past these budgets the agent raises
+`Agent::IdleTimeoutError` (with `.phase = :first_byte` or `:idle`) and the
+HTTP connection is rebuilt to avoid reusing a socket in an unknown state.
+Cancellation wins over timeout when both fire (see `process_request_loop`).
 
 ### Cleanup
 

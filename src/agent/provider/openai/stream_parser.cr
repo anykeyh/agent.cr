@@ -23,40 +23,120 @@ class Agent
           body_io : IO,
           response : Response,
           cancel : -> Bool,
+          *,
+          first_byte_timeout : Time::Span? = nil,
+          idle_timeout : Time::Span? = nil,
         ) : {Message, Usage, String?}
           tool_call_deltas = {} of Int32 => ToolCallDelta
           content_buffer = String::Builder.new
           reasoning_buffer = String::Builder.new
           usage = Usage.new
           finish_reason = nil
+          read_count = 0
 
-          body_io.each_line do |line|
-            # Check for cancellation
-            if cancel.call
-              break
+          # Apply per-read timeouts to the IO when it supports them. Real
+          # HTTP::Client body_io (HTTP::ChunkedContent / SSL sockets) honours
+          # the timeout set on the underlying socket via HTTP::Client#read_timeout.
+          # Custom IOs (tests, IO::Memory) silently ignore these setters.
+          #
+          # The first read uses `first_byte_timeout`; after every successful
+          # read we switch to `idle_timeout`. When `first_byte_timeout` is nil
+          # (dynamic first-byte disabled), both reads use `idle_timeout`.
+          effective_first = first_byte_timeout || idle_timeout
+          apply_read_timeout(body_io, effective_first) if effective_first
+
+          loop do
+            # Check for cancellation before each blocking read — the cancel
+            # flag and the IO timeout race independently, but cancel should
+            # win when both fire (see process_request_loop's order).
+            break if cancel.call
+
+            # `#gets` consults `read_timeout` each invocation on IOs that
+            # support it. Catch IO::TimeoutError and re-raise as IdleTimeoutError
+            # with the right phase so callers get a consistent Agent::Error type
+            # (this also lets http_post_stream match phase without inspecting
+            # the partial message — partial_msg is only set on cancellation).
+            line = begin
+              body_io.gets(chomp: true)
+            rescue ex : IO::TimeoutError
+              phase = read_count.zero? ? :first_byte : :idle
+              timeout = read_count.zero? ? effective_first : idle_timeout
+              raise IdleTimeoutError.new(phase, timeout, cause: ex)
+            end
+            break if line.nil? # EOF
+            read_count += 1
+
+            # Switch to the idle (inter-byte) budget for subsequent reads.
+            # Any byte arrival — including comment lines like
+            # `: OPENROUTER PROCESSING`, empty lines, and the `[DONE]`
+            # sentinel — resets the timer because `read_timeout` is per-read.
+            if idle_timeout && idle_timeout != effective_first
+              apply_read_timeout(body_io, idle_timeout)
             end
 
-            line = line.strip
-            next if line.empty?
-            next unless line.starts_with?("data:")
-
-            # SSE sentinel — skip [DONE] (with or without space after data:)
-            rest = line[5..].lstrip(' ')
-            next if rest.starts_with?("[DONE]")
-
-            json = begin
-              JSON.parse(rest)
-            rescue JSON::ParseException
-              next
-            end
-            parsed = json.as_h? || next
-
-            usage = parse_usage(parsed, usage)
-            finish_reason = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_call_deltas) || finish_reason
+            usage, finish_reason = handle_line(
+              line,
+              response,
+              content_buffer,
+              reasoning_buffer,
+              tool_call_deltas,
+              usage,
+              finish_reason,
+            )
           end
 
           final_message = build_final_message(content_buffer, reasoning_buffer, tool_call_deltas)
           {final_message, usage, finish_reason}
+        end
+
+        # Process a single SSE line. Returns the updated {usage, finish_reason}
+        # tuple so the caller can thread state across iterations. Lines that are
+        # empty, non-`data:` prefixed, the `[DONE]` sentinel, or unparseable
+        # JSON are no-ops (per SSE convention, any byte arrival resets the idle
+        # timer — that reset happens in `#parse` after each successful read,
+        # regardless of whether the line produced deltas).
+        private def handle_line(
+          line : String,
+          response : Response,
+          content_buffer : String::Builder,
+          reasoning_buffer : String::Builder,
+          tool_call_deltas : Hash(Int32, ToolCallDelta),
+          usage : Usage,
+          finish_reason : String?,
+        ) : {Usage, String?}
+          line = line.strip
+          return {usage, finish_reason} if line.empty?
+          return {usage, finish_reason} unless line.starts_with?("data:")
+
+          # SSE sentinel — skip [DONE] (with or without space after data:)
+          rest = line[5..].lstrip(' ')
+          return {usage, finish_reason} if rest.starts_with?("[DONE]")
+
+          json = begin
+            JSON.parse(rest)
+          rescue JSON::ParseException
+            return {usage, finish_reason}
+          end
+          parsed = json.as_h?
+          return {usage, finish_reason} unless parsed
+
+          new_usage = parse_usage(parsed, usage)
+          new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_call_deltas) || finish_reason
+          {new_usage, new_finish}
+        end
+
+        # Best-effort per-read timeout application. Uses runtime dispatch
+        # because the compile-time type of `io` is `IO+` and most concrete
+        # IOs (including HTTP::ChunkedContent + SSL sockets) implement
+        # `read_timeout=` even when the abstract type does not surface it.
+        # IOs that don't (e.g. IO::Memory) silently no-op via the unmatched
+        # case branch.
+        private def apply_read_timeout(io : IO, timeout : Time::Span?) : Nil
+          return unless timeout
+          case io
+          when .responds_to?(:read_timeout=)
+            io.read_timeout = timeout
+          end
         end
 
         private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage

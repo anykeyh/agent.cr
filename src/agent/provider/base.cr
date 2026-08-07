@@ -17,7 +17,21 @@ class Agent
       # Parse a streaming SSE response body and push Chunks onto `response`.
       # Returns the final assembled {Message, Usage, finish_reason}.
       # The `cancel` callback returns true if the caller has requested cancellation.
-      abstract def parse_stream(io : IO, response : Response, cancel : -> Bool) : {Message, Usage, String?}
+      #
+      # `first_byte_timeout` / `idle_byte_timeout` are per-read Time::Span
+      # budgets (AGENTS.md). Implementations should apply `first_byte_timeout`
+      # to the read preceding the first SSE byte, and switch to
+      # `idle_byte_timeout` afterward; any byte arrival (including comment /
+      # heartbeat lines, empty lines, `[DONE]` sentinel) resets the timer.
+      # When the IO does not support a per-read timeout, providers may safely
+      # fall back to the HTTP client's configured `read_timeout`.
+      abstract def parse_stream(
+        io : IO,
+        response : Response,
+        cancel : -> Bool,
+        first_byte_timeout : Time::Span? = nil,
+        idle_timeout : Time::Span? = nil,
+      ) : {Message, Usage, String?}
 
       # The base URI for the HTTP client (scheme, host, port, optional path prefix).
       abstract def base_uri : URI
