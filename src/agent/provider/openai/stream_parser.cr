@@ -104,7 +104,7 @@ class Agent
               response.push_chunk(Response::Chunk.new(c, Response::ChunkKind::Content))
             end
 
-            if rc = delta["reasoning_content"]?.try(&.as_s?)
+            if rc = reasoning_delta_text(delta)
               reasoning_buffer << rc
               response.push_chunk(Response::Chunk.new(rc, Response::ChunkKind::Reasoning))
             end
@@ -113,6 +113,40 @@ class Agent
           end
 
           finish_reason
+        end
+
+        # Extracts the reasoning text for a single delta across the field shapes
+        # used by different providers. Pushes exactly one chunk per delta: the
+        # first non-empty form found in a fixed precedence order, so providers
+        # that emit both a string field and `reasoning_details` (e.g. OpenRouter)
+        # are not double-counted.
+        #
+        # Order: `reasoning_content` (DeepSeek native / vLLM) -> `reasoning`
+        # (OpenRouter, Gemini-compat) -> `thinking` (Anthropic-via-proxy) ->
+        # `reasoning_details[].text` (OpenAI Responses / OpenRouter structured).
+        private def reasoning_delta_text(delta : Hash(String, JSON::Any)) : String?
+          {"reasoning_content", "reasoning", "thinking"}.each do |key|
+            if text = delta[key]?.try(&.as_s?)
+              return text
+            end
+          end
+
+          # OpenAI Responses / OpenRouter structured form. Concatenate all
+          # `reasoning.text` items in this delta; other types in the array
+          # (e.g. `summary`, `encrypted`) are intentionally skipped.
+          if details = delta["reasoning_details"]?.try(&.as_a?)
+            joined = details.each_with_object(String::Builder.new) do |item, buf|
+              next unless item_h = item.as_h?
+              next unless item_h["type"]?.try(&.as_s?) == "reasoning.text"
+              if t = item_h["text"]?.try(&.as_s?)
+                buf << t
+              end
+            end
+            s = joined.to_s
+            return s unless s.empty?
+          end
+
+          nil
         end
 
         private def process_tool_call_deltas(
