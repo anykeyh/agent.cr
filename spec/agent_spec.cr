@@ -424,6 +424,91 @@ describe Agent do
     end
   end
 
+  it "accumulates usage across the auto-resolve tool loop" do
+    # A mock server that bills every iteration of the tool loop:
+    #   1st request -> tool call, usage 10/5/15
+    #   2nd request -> normal text, usage 20/30/50
+    # Response#metadata must report the sum (30/35/65) — the whole turn's
+    # provider calls — not only the finishing iteration's counts.
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "test_tool", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"input":"world"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Tool result received: processed"
+          reply.each_char do |ch|
+            data = {"choices" => [{"delta" => {"content" => ch.to_s}, "index" => 0}]}.to_json
+            ctx.response.puts "data: #{data}"
+            ctx.response.flush
+          end
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => 30, "total_tokens" => 50}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+      agent.register_tool("test_tool", "A test tool",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            input: {type: "string"},
+          },
+          required: ["input"],
+        })
+      ) do |args|
+        "Processed: #{args["input"]?.try(&.as_s) || ""}"
+      end
+
+      resp = agent.ask("Run the tool")
+      resp.join
+
+      resp.finish_reason.should eq("stop")
+      resp.metadata.prompt_tokens.should eq(30)
+      resp.metadata.completion_tokens.should eq(35)
+      resp.metadata.total_tokens.should eq(65)
+    ensure
+      server.close
+    end
+  end
+
   it "reports error when auto-resolve tool callback raises" do
     call_count = 0
     server = HTTP::Server.new do |ctx|

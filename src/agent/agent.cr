@@ -441,6 +441,11 @@ class Agent
     end
     messages = build_messages(history_snapshot, [] of Message)
 
+    # Accumulates each iteration's usage so `Response#metadata` reports the
+    # whole turn — every provider call of the tool loop — not just the
+    # finishing iteration's counts.
+    total_usage = Usage.new
+
     loop do
       iteration += 1
 
@@ -474,6 +479,7 @@ class Agent
 
       # Append the assistant message to history under the lock.
       @history.lock { |h| h << msg }
+      total_usage = total_usage + usage
 
       # Determine whether to auto-resolve tools (read under the lock).
       has_registered_tools = @registered_tools.lock(&.empty?.!)
@@ -482,7 +488,7 @@ class Agent
       no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || !has_registered_tools
       if no_tools
         trim_history!
-        response.finish(msg, usage, finish_reason: finish_reason)
+        response.finish(msg, total_usage, finish_reason: finish_reason)
         break
       end
 
@@ -496,7 +502,7 @@ class Agent
       # assistant(tool_calls) — otherwise the next API request will be invalid.
       if results.empty?
         trim_history!
-        response.finish(msg, usage, finish_reason: finish_reason)
+        response.finish(msg, total_usage, finish_reason: finish_reason)
         break
       end
 

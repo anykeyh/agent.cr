@@ -127,4 +127,34 @@ describe Agent::Usage do
     u = Agent::Usage.new(prompt_tokens: 10, completion_tokens: 20, total_tokens: 30)
     u.total_tokens.should eq(30)
   end
+
+  it "sums every field with nil-safe +" do
+    a = Agent::Usage.new(prompt_tokens: 10, completion_tokens: 5, total_tokens: 15)
+    b = Agent::Usage.new(prompt_tokens: 20, completion_tokens: 8, total_tokens: 28)
+    sum = a + b
+
+    sum.prompt_tokens.should eq(30)
+    sum.completion_tokens.should eq(13)
+    sum.total_tokens.should eq(43)
+
+    # The operands stay unchanged.
+    a.prompt_tokens.should eq(10)
+    b.total_tokens.should eq(28)
+  end
+
+  it "treats nil as zero in +, staying nil only when both sides are nil" do
+    a = Agent::Usage.new(prompt_tokens: 10)
+    b = Agent::Usage.new(completion_tokens: 8)
+    sum = a + b
+
+    sum.prompt_tokens.should eq(10)
+    sum.completion_tokens.should eq(8)
+    sum.total_tokens.should be_nil
+
+    # All-nil stays all-nil (preserved by the emit_nulls payload).
+    empty = Agent::Usage.new + Agent::Usage.new
+    empty.prompt_tokens.should be_nil
+    empty.completion_tokens.should be_nil
+    empty.total_tokens.should be_nil
+  end
 end

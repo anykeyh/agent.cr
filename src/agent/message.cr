@@ -319,6 +319,23 @@ class Agent
 
     def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
     end
+
+    # Nil-safe addition: sums each field over both usages. A field is nil in
+    # the result only when it is nil on both sides, so `Usage.new + Usage.new`
+    # stays all-nil. Lets callers accumulate usage across a multi-iteration
+    # tool loop instead of keeping only the last iteration's counts.
+    def +(other : Usage) : Usage
+      Usage.new(
+        add(prompt_tokens, other.prompt_tokens),
+        add(completion_tokens, other.completion_tokens),
+        add(total_tokens, other.total_tokens),
+      )
+    end
+
+    private def add(a : Int32?, b : Int32?) : Int32?
+      return nil if a.nil? && b.nil?
+      (a || 0) + (b || 0)
+    end
   end
 
   # A message in the conversation.

@@ -421,7 +421,7 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 |---|---|
 | `.stream { \|chunk\| }` | Yield each delta as it arrives from the API |
 | `.message` | Block until the final `Message` is ready, then return it |
-| `.metadata` | Block until `Usage` (token counts) is ready, then return it |
+| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage |
 | `.join` | Block until both message and metadata are ready |
 | `.finished?` | Poll whether the response is complete |
 | `.error?` | Whether the response represents a failed request |
