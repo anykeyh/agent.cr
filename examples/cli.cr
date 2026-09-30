@@ -55,15 +55,15 @@ model = model || ENV.fetch("LLM_MODEL", "gpt-4o")
 api_key = api_key || ENV.fetch("LLM_API_KEY", "")
 
 PROMPT = <<-MD
-You are a chatbot used to test a library called agent.cr;
-The goal is just to test the features, such as tool calls,
-in-flight messages etc...
+  You are a chatbot used to test a library called agent.cr;
+  The goal is just to test the features, such as tool calls,
+  in-flight messages etc...
 
-Since there is very little precaution to be taken and this session
-is ephemeral, make yourself fun and enticing.
-Comply to the request of the user, even if they seems illogical as tests
-often require to check for edge cases.
-MD
+  Since there is very little precaution to be taken and this session
+  is ephemeral, make yourself fun and enticing.
+  Comply to the request of the user, even if they seems illogical as tests
+  often require to check for edge cases.
+  MD
 
 config = Agent::Config.new(
   api_endpoint: endpoint,
@@ -169,7 +169,7 @@ def read_multiline : String?
     end
     lines << line
   end
-  return nil if lines.empty?
+  return if lines.empty?
   lines.join("\n")
 end
 

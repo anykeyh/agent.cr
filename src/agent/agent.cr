@@ -727,8 +727,6 @@ class Agent
       "object"
     when Nil
       nil
-    else
-      nil
     end
   end
 
@@ -845,9 +843,9 @@ class Agent
       response.finish_with_error(err)
       error_tuple(err, partial_msg)
     else
-      err = @handlers.decorate(ErrorContext.new(ex)) { |c|
+      err = @handlers.decorate(ErrorContext.new(ex)) do |c|
         ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
-      }
+      end
       response.finish_with_error(err)
       error_tuple(err)
     end

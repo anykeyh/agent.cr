@@ -114,11 +114,10 @@ class Agent
       end
     end
 
-    private def parse_timeout(timeout : Time::Span | Int32 | Nil) : Time::Span?
+    private def parse_timeout(timeout : Time::Span | Int32?) : Time::Span?
       case timeout
       when Int32      then timeout.seconds
       when Time::Span then timeout
-      else                 nil
       end
     end
 
@@ -149,7 +148,7 @@ class Agent
     #   estimated_tokens = prompt_bytes / 4
     #   timeout = clamp(base + estimated_tokens * ms_per_token, min, max)
     def compute_first_byte_timeout(prompt_bytes : Int) : Time::Span?
-      return nil unless @compute_first_byte_timeout
+      return unless @compute_first_byte_timeout
       estimated_tokens = (prompt_bytes.to_i64 / 4)
       timeout_ms = @first_byte_timeout_base.total_milliseconds.to_i64 +
                    estimated_tokens * @first_byte_timeout_ms_per_token.to_i64

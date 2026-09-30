@@ -56,7 +56,7 @@ jobs:
 
       - name: Lint
         if: matrix.crystal == '1.21.0'
-        run: bin/ameba
+        run: shards build ameba && bin/ameba
 
       - name: Library compiles
         run: crystal build --no-codegen src/agent.cr

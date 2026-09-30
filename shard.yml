@@ -14,7 +14,13 @@ license: MIT
 development_dependencies:
   ameba:
     github: crystal-ameba/ameba
-    version: ~> 1.6
+    version: ~> 1.7
   dotenv:
     github: gdotdesign/cr-dotenv
     version: ~> 1.0
+
+# ameba 1.7 has no postinstall; this target lets `shards build ameba` produce
+# the linter binary (see the Lint step in .github/workflows/ci.yml).
+targets:
+  ameba:
+    main: lib/ameba/bin/ameba.cr

@@ -222,7 +222,7 @@ class Agent
       end
     rescue e : ArgumentError
       raise e
-    rescue e : File::Error
+    rescue File::Error
       raise ArgumentError.new("Cannot read attachment: #{path}")
     end
 
@@ -333,7 +333,7 @@ class Agent
     end
 
     private def add(a : Int32?, b : Int32?) : Int32?
-      return nil if a.nil? && b.nil?
+      return if a.nil? && b.nil?
       (a || 0) + (b || 0)
     end
   end

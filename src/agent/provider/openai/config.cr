@@ -68,11 +68,10 @@ class Agent
           end
         end
 
-        private def parse_timeout(timeout : Time::Span | Int32 | Nil) : Time::Span?
+        private def parse_timeout(timeout : Time::Span | Int32?) : Time::Span?
           case timeout
           when Int32      then timeout.seconds
           when Time::Span then timeout
-          else                 nil
           end
         end
       end

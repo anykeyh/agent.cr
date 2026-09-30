@@ -19,7 +19,7 @@ private class MockTimeoutIO < IO
   end
 
   def gets(chomp : Bool = true) : String?
-    return nil if @i >= @lines.size
+    return if @i >= @lines.size
     delay = @i < @delays.size ? @delays[@i] : Time::Span.zero
 
     if t = @read_timeout
@@ -127,8 +127,7 @@ end
 describe Agent::Provider::OpenAI::StreamParser do
   it "treats explicit reasoning:null as no chunk" do
     chunks, _reasoning = parse_lines([
-      %(data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning":null},
-        "finish_reason":"stop"}]}),
+      %(data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning":null},"finish_reason":"stop"}]}),
       "data: [DONE]",
     ])
     chunks.should be_empty
