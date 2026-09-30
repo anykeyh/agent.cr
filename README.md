@@ -1,5 +1,8 @@
 # agent-cr
 
+[![CI](https://github.com/anykeyh/agent.cr/actions/workflows/ci.yml/badge.svg)](https://github.com/anykeyh/agent.cr/actions/workflows/ci.yml)
+[![Periodic builds](https://github.com/anykeyh/agent.cr/actions/workflows/periodic.yml/badge.svg)](https://github.com/anykeyh/agent.cr/actions/workflows/periodic.yml)
+
 A Crystal shard for building agentic loops with OpenAI-compatible APIs.
 
 Inspired by [RubyLLM](https://rubyllm.com/) — a fantastic Ruby gem for interacting with AI models.
@@ -15,7 +18,7 @@ Add this to your `shard.yml`:
 ```yaml
 dependencies:
   agent-cr:
-    github: anykeyh/agent-cr
+    github: anykeyh/agent.cr
 ```
 
 Then run:
@@ -24,7 +27,7 @@ Then run:
 shards install
 ```
 
-> Built with Crystal >= 1.2
+> Built with Crystal >= 1.10
 
 > **Fiber safety:** Safe to call `#ask` from multiple fibers; the agent serialises requests through a single background fiber. Multi-thread mode (`-Dpreview_mt`) is not tested.
 
