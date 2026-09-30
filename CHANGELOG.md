@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-30
+
+First stable release. This patch release hardens the tool auto-resolve loop
+and the background agent fiber, and replaces string-prefix error detection
+with structured exception types.
+
 ### Fixed
 
 - **Critical: Duplicate tool results in auto-resolve loop** (#1). Tool-result

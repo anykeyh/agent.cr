@@ -1,5 +1,5 @@
 name: agent-cr
-version: 0.1.0
+version: 0.1.1
 
 description: |
   A Crystal shard for building agentic loops with OpenAI-compatible APIs.
