@@ -31,6 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The runner image's cached apt lists can lag behind the Ubuntu mirror
+      # (package fetches 404 after a point release supersedes them), and
+      # install-crystal apt-installs Crystal's system libraries without
+      # refreshing them first.
+      - name: Refresh apt package lists
+        run: sudo apt-get update
+
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: ${{ matrix.crystal }}
@@ -87,6 +94,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Same apt-list staleness guard as the spec job.
+      - name: Refresh apt package lists
+        run: sudo apt-get update
 
       - uses: crystal-lang/install-crystal@v1
         with:
