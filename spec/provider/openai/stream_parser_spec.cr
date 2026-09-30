@@ -74,7 +74,11 @@ private def parse_lines(lines : Array(String))
   msg, usage, _finish = Agent::Provider::OpenAI::StreamParser.parse(io, response, -> { false })
   response.finish(msg, usage)
 
-  collected.each { |text| reasoning_chunks << text }
+  # Channel#each only exists on Crystal >= 1.21; drain with receive? instead so
+  # the spec suite compiles on every supported version.
+  while text = collected.receive?
+    reasoning_chunks << text
+  end
   {reasoning_chunks, msg.reasoning}
 end
 

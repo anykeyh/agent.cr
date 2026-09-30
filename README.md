@@ -1,7 +1,6 @@
 # agent-cr
 
 [![CI](https://github.com/anykeyh/agent.cr/actions/workflows/ci.yml/badge.svg)](https://github.com/anykeyh/agent.cr/actions/workflows/ci.yml)
-[![Periodic builds](https://github.com/anykeyh/agent.cr/actions/workflows/periodic.yml/badge.svg)](https://github.com/anykeyh/agent.cr/actions/workflows/periodic.yml)
 
 A Crystal shard for building agentic loops with OpenAI-compatible APIs.
 
@@ -27,7 +26,7 @@ Then run:
 shards install
 ```
 
-> Built with Crystal >= 1.10
+> Built with Crystal >= 1.19 (uses the stdlib `sync` module)
 
 > **Fiber safety:** Safe to call `#ask` from multiple fibers; the agent serialises requests through a single background fiber. Multi-thread mode (`-Dpreview_mt`) is not tested.
 

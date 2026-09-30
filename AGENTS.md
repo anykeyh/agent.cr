@@ -226,7 +226,7 @@ cancel channel after each SSE line and aborts cleanly, calling
 
 ### Prerequisites
 
-- Crystal >= 1.10
+- Crystal >= 1.19 (the library requires the stdlib `sync` module, added in 1.19.0)
 - `OPENAI_API_KEY` environment variable set when running integration tests against a real API.
 
 ### Example configuration pattern
