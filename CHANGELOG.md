@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-19
+
+### Fixed
+
+- Tool-argument validation no longer skips the type check for JSON `null`.
+  A `null` argument against a property that declares a `type` (e.g.
+  `{"type": "array"}`) is now rejected with
+  `Field '<name>' expected type '<type>', got 'null'`, giving the model a
+  structured signal to self-correct. `null` still passes for properties that
+  declare no `type` and for arguments absent from `properties`.
+- `validate_tool_args` no longer raises (and kills the agent fiber) on schemas
+  that declare `type` as an array of alternatives, e.g. `"type": ["string",
+  "null"]`.
+
+### Added
+
+- Tool-argument validation honours `items` on array properties: elements of
+  the wrong type are rejected with `Field '<name>' expected array items of
+  type '<type>', got '<actual>' at index <i>`.
+
 ## [0.1.1] - 2026-09-30
 
 First stable release. This patch release hardens the tool auto-resolve loop

@@ -624,6 +624,276 @@ describe Agent do
     end
   end
 
+  it "rejects null for a typed tool argument and reports it to the model" do
+    # 1st request -> tool call with `"ids": null` against an array-typed property
+    # 2nd request -> carries the validation error back to the model as the tool result
+    call_count = 0
+    request_bodies = [] of String
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        request_bodies << (ctx.request.body.try(&.gets_to_end) || "{}")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "show_documents", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"ids": null})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Recovered"
+          final = {"choices" => [{"delta" => {"content" => reply}, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      callback_called = false
+      agent.register_tool("show_documents", "Show documents by id",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            ids: {type: "array", items: {type: "string"}},
+          },
+          required: ["ids"],
+        })
+      ) do |_args|
+        callback_called = true
+        "docs"
+      end
+
+      resp = agent.ask("Show the documents")
+      resp.join
+
+      # The callback must never see the null argument.
+      callback_called.should be_false
+      resp.message.content.should eq("Recovered")
+
+      # The tool result fed back to the model names both the expectation and
+      # the received type, so a retrying model has a structured signal.
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[2].content.should eq(
+        "Error validating arguments for tool 'show_documents': Field 'ids' expected type 'array', got 'null'"
+      )
+      request_bodies[1].should contain("expected type 'array', got 'null'")
+    ensure
+      server.close
+    end
+  end
+
+  it "validates array item types when the schema declares items" do
+    # 1st request -> tool call with a mixed-type array `{"ids": ["a", 2]}`
+    # 2nd request -> tool call with a valid array (after self-correction)
+    # 3rd request -> normal text response
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          args = %({"ids": ["a", 2]})
+        elsif call_count == 2
+          args = %({"ids": ["ok"]})
+        else
+          args = nil
+        end
+
+        if args
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_00#{call_count}", "type" => "function", "function" => {"name" => "show_documents", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => args}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Done"
+          final = {"choices" => [{"delta" => {"content" => reply}, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      callback_calls = 0
+      received_ids : Array(JSON::Any)? = nil
+      agent.register_tool("show_documents", "Show documents by id",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            ids: {type: "array", items: {type: "string"}},
+          },
+          required: ["ids"],
+        })
+      ) do |args|
+        callback_calls += 1
+        received_ids = args["ids"]?.try(&.as_a)
+        "docs"
+      end
+
+      resp = agent.ask("Show the documents")
+      resp.join
+
+      resp.message.content.should eq("Done")
+
+      # The mixed-type call was rejected with a precise message...
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[2].content.should eq(
+        "Error validating arguments for tool 'show_documents': Field 'ids' expected array items of type 'string', got 'number' at index 1"
+      )
+
+      # ...and the valid retry reached the callback exactly once.
+      callback_calls.should eq(1)
+      received_ids.try(&.map(&.as_s)).should eq(["ok"])
+
+      # History: user, assistant(tool_calls), tool(error),
+      # assistant(tool_calls), tool(result), assistant(final)
+      agent.history.size.should eq(6)
+    ensure
+      server.close
+    end
+  end
+
+  it "does not reject null when the property schema declares no type" do
+    # Compat valve: a property without a declared `type` (or an unknown
+    # argument) accepts null — only declared types reject it.
+    call_count = 0
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        ctx.request.body.try(&.gets_to_end)
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "store", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"payload": null})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Stored"
+          final = {"choices" => [{"delta" => {"content" => reply}, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+
+      callback_called = false
+      received_payload : JSON::Any? = nil
+      agent.register_tool("store", "Store a payload",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            payload: {description: "anything"},
+          },
+        })
+      ) do |args|
+        callback_called = true
+        received_payload = args["payload"]?
+        "ok"
+      end
+
+      resp = agent.ask("Store it")
+      resp.join
+
+      callback_called.should be_true
+      resp.message.content.should eq("Stored")
+      received_payload.try(&.raw).should be_nil
+    ensure
+      server.close
+    end
+  end
+
   it "trims history with max_history" do
     call_count = 0
     server = HTTP::Server.new do |ctx|

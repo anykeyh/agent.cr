@@ -678,13 +678,38 @@ class Agent
 
     # Check that all provided arguments have known types.
     args.each do |key, value|
-      if prop = props[key]?
-        if type_name = type_name(value)
-          expected = prop["type"]?.try(&.as_s)
-          if expected && !type_matches?(type_name, expected)
-            errors << "Field '#{key}' expected type '#{expected}', got '#{type_name}'"
-          end
-        end
+      next unless prop = props[key]?
+
+      # `as_s?` (not `as_s`): a schema may declare `type` as an array of
+      # alternatives (e.g. ["string", "null"]); casting that to String would
+      # raise here and kill the agent fiber.
+      expected = prop["type"]?.try(&.as_s?)
+      next unless expected
+
+      actual = type_name(value)
+      if actual && !type_matches?(actual, expected)
+        errors << "Field '#{key}' expected type '#{expected}', got '#{actual}'"
+      end
+
+      errors.concat(array_item_errors(key, value, prop)) if actual == "array"
+    end
+
+    errors
+  end
+
+  # Validate array element types against a property schema's `items` type.
+  private def array_item_errors(key : String, value : JSON::Any, prop : JSON::Any) : Array(String)
+    errors = [] of String
+    return errors unless elements = value.as_a?
+
+    items = prop["items"]?.try(&.as_h?)
+    item_type = items.try { |h| h["type"]?.try(&.as_s?) }
+    return errors unless item_type
+
+    elements.each_with_index do |item, index|
+      item_actual = type_name(item)
+      if item_actual && !type_matches?(item_actual, item_type)
+        errors << "Field '#{key}' expected array items of type '#{item_type}', got '#{item_actual}' at index #{index}"
       end
     end
 
@@ -705,6 +730,8 @@ class Agent
       actual_type == "string"
     when "boolean"
       actual_type == "boolean"
+    when "null"
+      actual_type == "null"
     else
       true
     end
@@ -726,7 +753,10 @@ class Agent
     when Hash
       "object"
     when Nil
-      nil
+      # JSON null is a real type: a property declaring `type` never accepts
+      # null (JSON Schema), so it must be reported and fail the type check
+      # like any other mismatch instead of passing validation silently.
+      "null"
     end
   end
 
