@@ -15,6 +15,130 @@ class Agent
         end
       end
 
+      # Routes tool-call fragments to per-call accumulator entries.
+      #
+      # The OpenAI wire format tags every tool-call delta with an integer
+      # `index`, and most providers also repeat the call `id` on every
+      # fragment. Some upstreams (e.g. OpenRouter providers) omit `index`,
+      # and argument fragments typically carry neither `id` nor `name`, so
+      # routing degrades through three tiers:
+      #
+      #   1. fragment carries `id` -> join (or open) the entry with that id.
+      #   2. fragment carries `index` (no id) -> join (or open) the entry
+      #      first opened under that index.
+      #   3. fragment carries neither -> continue the most recently routed
+      #      entry, unless its `name` is set and the fragment names a
+      #      different function — in that case open a new entry rather than
+      #      merging two distinct calls (see route_by_cursor).
+      #
+      # Internal keys only need to be unique; entries surface in
+      # first-appearance order because Crystal hashes keep insertion order.
+      private class ToolCallAccumulator
+        getter deltas : Hash(Int32, ToolCallDelta)
+
+        @keys_by_id = {} of String => Int32
+        @keys_by_index = {} of Int32 => Int32
+        @cursor : Int32?
+        @next_key = 0
+
+        def initialize
+          @deltas = {} of Int32 => ToolCallDelta
+        end
+
+        def route(tcd : Hash(String, JSON::Any)) : ToolCallDelta
+          id = tcd["id"]?.try(&.as_s?)
+          index = tcd["index"]?.try(&.as_i)
+
+          key = if id && !id.empty?
+                  route_by_id(id, index)
+                elsif idx = index
+                  route_by_index(idx)
+                else
+                  route_by_cursor(tcd)
+                end
+
+          @cursor = key
+          @deltas[key] ||= ToolCallDelta.new
+        end
+
+        # Smallest internal key not already occupied. Synthetic keys may be
+        # needed when the provider reuses `index` values across distinct
+        # calls or omits `index` entirely.
+        private def new_key : Int32
+          while @deltas.has_key?(@next_key)
+            @next_key += 1
+          end
+          @next_key
+        end
+
+        # An id is strong identity: fragments sharing an id always belong to
+        # the same call, and two different ids must never share an entry —
+        # a provider that reuses `index` values across parallel calls would
+        # otherwise concatenate their arguments. A fresh id opens a new
+        # entry under its `index` when that key is free, adopts an id-less
+        # entry already opened under that index, or takes a synthetic key.
+        private def route_by_id(id : String, index : Int32?) : Int32
+          if key = @keys_by_id[id]?
+            return key
+          end
+
+          key = if idx = index
+                  if entry = @deltas[idx]?
+                    if entry.id.empty?
+                      # Adopt the id-less entry opened under this index.
+                      @keys_by_index[idx] ||= idx
+                      idx
+                    else
+                      # Occupied by a different call — never merge ids.
+                      new_key
+                    end
+                  else
+                    idx
+                  end
+                else
+                  new_key
+                end
+
+          @keys_by_id[id] = key
+          @keys_by_index[index] = key if index
+          key
+        end
+
+        # Explicit `index` is authoritative for id-less fragments — this
+        # keeps standard OpenAI-style streams on their previous code path.
+        private def route_by_index(index : Int32) : Int32
+          if key = @keys_by_index[index]?
+            return key
+          end
+
+          # Prefer the literal index as the internal key; if a previous
+          # entry already occupies it, allocate a fresh synthetic key.
+          key = @deltas.has_key?(index) ? new_key : index
+          @keys_by_index[index] = key
+          key
+        end
+
+        # Neither id nor index: continue the entry routed most recently.
+        # If that entry already carries a function name and the fragment
+        # names a different function, the provider has moved on to another
+        # call without emitting any identifier — open a new entry instead
+        # of concatenating two calls' argument fragments (which can parse
+        # as valid JSON while silently losing keys) or letting the later
+        # call's name overwrite the earlier one. The known cost: a provider
+        # that streams a single name in pieces *and* omits id and index
+        # would split into multiple entries — far rarer than the collisions
+        # this guard prevents.
+        private def route_by_cursor(tcd : Hash(String, JSON::Any)) : Int32
+          if key = @cursor
+            entry_name = @deltas[key].name
+            incoming_name = tcd["function"]?.try(&.as_h?).try(&.["name"]?).try(&.as_s?)
+            return key if entry_name.empty? || incoming_name.nil? ||
+                          incoming_name.empty? || entry_name == incoming_name
+          end
+          new_key
+        end
+      end
+
       # Parses an OpenAI SSE streaming response.
       module StreamParser
         extend self
@@ -27,7 +151,7 @@ class Agent
           first_byte_timeout : Time::Span? = nil,
           idle_timeout : Time::Span? = nil,
         ) : {Message, Usage, String?}
-          tool_call_deltas = {} of Int32 => ToolCallDelta
+          tool_calls = ToolCallAccumulator.new
           content_buffer = String::Builder.new
           reasoning_buffer = String::Builder.new
           usage = Usage.new
@@ -79,13 +203,13 @@ class Agent
               response,
               content_buffer,
               reasoning_buffer,
-              tool_call_deltas,
+              tool_calls,
               usage,
               finish_reason,
             )
           end
 
-          final_message = build_final_message(content_buffer, reasoning_buffer, tool_call_deltas)
+          final_message = build_final_message(content_buffer, reasoning_buffer, tool_calls.deltas)
           {final_message, usage, finish_reason}
         end
 
@@ -100,7 +224,7 @@ class Agent
           response : Response,
           content_buffer : String::Builder,
           reasoning_buffer : String::Builder,
-          tool_call_deltas : Hash(Int32, ToolCallDelta),
+          tool_calls : ToolCallAccumulator,
           usage : Usage,
           finish_reason : String?,
         ) : {Usage, String?}
@@ -121,7 +245,7 @@ class Agent
           return {usage, finish_reason} unless parsed
 
           new_usage = parse_usage(parsed, usage)
-          new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_call_deltas) || finish_reason
+          new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_calls) || finish_reason
           {new_usage, new_finish}
         end
 
@@ -167,7 +291,7 @@ class Agent
           response : Response,
           content_buffer : String::Builder,
           reasoning_buffer : String::Builder,
-          tool_call_deltas : Hash(Int32, ToolCallDelta),
+          tool_calls : ToolCallAccumulator,
         ) : String?
           finish_reason = nil
 
@@ -189,7 +313,7 @@ class Agent
               response.push_chunk(Response::Chunk.new(rc, Response::ChunkKind::Reasoning))
             end
 
-            process_tool_call_deltas(delta, tool_call_deltas, response)
+            process_tool_call_deltas(delta, tool_calls, response)
           end
 
           finish_reason
@@ -231,17 +355,15 @@ class Agent
 
         private def process_tool_call_deltas(
           delta : Hash(String, JSON::Any),
-          tool_call_deltas : Hash(Int32, ToolCallDelta),
+          tool_calls : ToolCallAccumulator,
           response : Response,
         ) : Nil
           tc_delta = delta["tool_calls"]?.try(&.as_a?) || return
-          tc_delta.each_with_index do |tcd_any, pos|
+          tc_delta.each do |tcd_any|
             tcd = tcd_any.as_h? || next
-            # Use the API-provided index if present, otherwise fall back to
-            # positional order (handles providers that omit the index field).
-            idx = tcd["index"]?.try(&.as_i) || pos
-
-            entry = tool_call_deltas[idx] ||= ToolCallDelta.new
+            # Route the fragment to its per-call entry (by id, then index,
+            # then most-recent — see ToolCallAccumulator).
+            entry = tool_calls.route(tcd)
             update_tool_call_id(entry, tcd)
             update_tool_call_function(entry, tcd, response)
           end

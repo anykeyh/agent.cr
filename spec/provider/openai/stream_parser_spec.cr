@@ -330,3 +330,160 @@ describe Agent::Provider::OpenAI::StreamParser do
     response.error?.should be_false
   end
 end
+
+# Tool-call delta routing. Regression specs for the positional fallback that
+# previously mapped every id-less, index-less fragment onto entry 0, merging
+# distinct tool calls (id/name overwritten by the later call, argument
+# fragments concatenated into invalid JSON).
+#
+# The motivating shape: some OpenRouter upstreams omit `index` on tool-call
+# deltas, and argument fragments carry neither `id` nor `name`, so routing
+# must fall back to ids and — as a last resort — the most recently routed
+# entry with a name-mismatch guard.
+def tool_call_lines(fragments : Array(Hash(String, JSON::Any))) : Array(String)
+  fragments.map do |frag|
+    body = {"choices" => [{"delta" => {"tool_calls" => [frag]}}]}
+    %(data: #{body.to_json})
+  end + ["data: [DONE]"]
+end
+
+def tool_fragment(id : String?, name : String?, arguments : String?) : Hash(String, JSON::Any)
+  frag = {} of String => JSON::Any
+  frag["id"] = JSON::Any.new(id) if id
+  fn = {} of String => JSON::Any
+  fn["name"] = JSON::Any.new(name) if name
+  fn["arguments"] = JSON::Any.new(arguments) if arguments
+  frag["function"] = JSON::Any.new(fn)
+  frag
+end
+
+def parse_tool_lines(lines : Array(String)) : Agent::Message
+  response = Agent::Response.new
+  spawn { response.stream { |_| } } # consume chunks so push_chunk doesn't block
+  Fiber.yield
+  io = IO::Memory.new(lines.join('\n'))
+  msg, usage, _finish = Agent::Provider::OpenAI::StreamParser.parse(io, response, -> { false })
+  response.finish(msg, usage)
+  msg
+end
+
+def parse_tool_fragments(fragments : Array(Hash(String, JSON::Any))) : Agent::Message
+  parse_tool_lines(tool_call_lines(fragments))
+end
+
+describe Agent::Provider::OpenAI::StreamParser do
+  it "separates interleaved parallel calls when fragments carry ids but no index" do
+    msg = parse_tool_fragments([
+      tool_fragment("call_a", "update_document_view", ""),
+      tool_fragment("call_b", "preview_view", ""),
+      tool_fragment("call_a", nil, %({"path":"x"})),
+      tool_fragment("call_b", nil, %({"kind":"page"})),
+    ])
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(2)
+    tcs[0].id.should eq("call_a")
+    tcs[0].name.should eq("update_document_view")
+    tcs[0].arguments.should eq(%({"path":"x"}))
+    tcs[1].id.should eq("call_b")
+    tcs[1].name.should eq("preview_view")
+    tcs[1].arguments.should eq(%({"kind":"page"}))
+  end
+
+  it "separates sequential calls when fragments have no index and the id appears only on each call's first fragment" do
+    # Previously: every fragment fell back to positional entry 0, merging
+    # the two calls into one (id/name from the later call, argument
+    # fragments concatenated into invalid JSON).
+    msg = parse_tool_fragments([
+      tool_fragment("call_a", "update_document_view", ""),
+      tool_fragment(nil, nil, %({"template":{"type":"page"}})),
+      tool_fragment("call_b", "preview_view", ""),
+      tool_fragment(nil, nil, %({"kind":"page"})),
+    ])
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(2)
+    tcs[0].id.should eq("call_a")
+    tcs[0].name.should eq("update_document_view")
+    tcs[0].arguments.should eq(%({"template":{"type":"page"}}))
+    tcs[1].id.should eq("call_b")
+    tcs[1].name.should eq("preview_view")
+    tcs[1].arguments.should eq(%({"kind":"page"}))
+  end
+
+  it "separates calls whose fragments reuse one index value with distinct ids" do
+    # Guard against upstreams that re-emit index 0 for every parallel call:
+    # a fresh id must never merge into an entry already carrying another id.
+    lines = [
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"update_document_view","arguments":""}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"template\\":{\\"type\\":\\"page\\"}}"}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"preview_view","arguments":""}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"kind\\":\\"page\\"}"}}]}}]}),
+      "data: [DONE]",
+    ]
+    msg = parse_tool_lines(lines)
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(2)
+    tcs[0].id.should eq("call_a")
+    tcs[0].arguments.should eq(%({"template":{"type":"page"}}))
+    tcs[1].id.should eq("call_b")
+    tcs[1].arguments.should eq(%({"kind":"page"}))
+  end
+
+  it "opens a new call when an id-less, index-less stream starts naming a different function" do
+    # Worst case: no id and no index anywhere. The name-mismatch guard is
+    # the only thing standing between the two calls.
+    msg = parse_tool_fragments([
+      tool_fragment(nil, "update_document_view", ""),
+      tool_fragment(nil, nil, %({"template":{"type":"page"}})),
+      tool_fragment(nil, "preview_view", ""),
+      tool_fragment(nil, nil, %({"kind":"page"})),
+    ])
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(2)
+    tcs[0].name.should eq("update_document_view")
+    tcs[0].arguments.should eq(%({"template":{"type":"page"}}))
+    tcs[1].name.should eq("preview_view")
+    tcs[1].arguments.should eq(%({"kind":"page"}))
+  end
+
+  it "keeps index-based accumulation unchanged for standard OpenAI-shaped streams" do
+    lines = [
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"update_document_view","arguments":""}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"template\\":{\\"type\\":\\"page\\"}}"}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"preview_view","arguments":""}}]}}]}),
+      %(data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\\"kind\\":\\"page\\"}"}}]}}]}),
+      %(data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+      "data: [DONE]",
+    ]
+    msg = parse_tool_lines(lines)
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(2)
+    tcs[0].id.should eq("call_a")
+    tcs[0].name.should eq("update_document_view")
+    tcs[0].arguments.should eq(%({"template":{"type":"page"}}))
+    tcs[1].id.should eq("call_b")
+    tcs[1].name.should eq("preview_view")
+    tcs[1].arguments.should eq(%({"kind":"page"}))
+  end
+
+  it "joins fragments sharing an id even when the id repeats on every fragment" do
+    # Providers that repeat the full name on every fragment must not open a
+    # new entry per fragment, and repeated names must not duplicate the
+    # ToolCallName chunk stream state.
+    msg = parse_tool_fragments([
+      tool_fragment("call_a", "update_document_view", ""),
+      tool_fragment("call_a", "update_document_view", %({"path")),
+      tool_fragment("call_a", "update_document_view", %(:"x"})),
+    ])
+
+    tcs = msg.tool_calls.should_not be_nil
+    tcs.size.should eq(1)
+    tcs[0].id.should eq("call_a")
+    tcs[0].name.should eq("update_document_view")
+    tcs[0].arguments.should eq(%({"path":"x"}))
+  end
+end
