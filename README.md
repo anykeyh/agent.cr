@@ -112,7 +112,7 @@ agent.reset
 
 ### History trimming
 
-Set `max_history` to limit the number of conversation turns kept in memory. The agent trims complete turn units (never orphaning tool messages).
+Set `max_history` to limit the number of conversation turns kept in memory. A turn is a user message and everything up to the next one (the assistant's reply, and with tools, its tool calls and their results); the oldest turns are dropped whole, so the kept history always starts at a user message and no tool result is ever orphaned.
 
 ```crystal
 config = Agent::Config.new(
@@ -200,6 +200,46 @@ puts resp.message.content # => "The weather in Paris is sunny."
 
 You can `register_tool` multiple times. All registered tools are merged into every request automatically. If a per-request tool has the same name as a registered tool, the registered callback wins.
 
+When the model calls a tool that isn't registered or is disabled, the agent answers that call with an error result and the model carries on. When a message calls a tool passed with `ask(tools:)`, the agent runs none of its tools and hands the whole message back to you to dispatch.
+
+A callback that raises gives the model an error result. Only the message of an `Agent::ToolError` is shown to the model; any other exception is logged, and the model sees only that the tool failed, so internal details never reach it:
+
+```crystal
+agent.register_tool("get_weather", ...) do |args|
+  city = args["city"].as_s
+  raise Agent::ToolError.new("Unknown city '#{city}'") unless known?(city)
+  fetch_weather(city) # a network error here reaches the model as "the tool failed"
+end
+```
+
+A `Handler` sees the exception on `ToolCallContext#error` after the callback runs. Use it to record why a tool failed, or carry your own fields on a `ToolError` subclass and return a different result for the model:
+
+```crystal
+class QuotaError < Agent::ToolError
+  getter tenant : String
+
+  def initialize(message, @tenant)
+    super(message)
+  end
+end
+
+class ToolFailures < Agent::Handler
+  def handle(ctx : Agent::ToolCallContext, next_proc) : Agent::Message
+    result = next_proc.call(ctx)
+    case err = ctx.error
+    when QuotaError
+      Metrics.tool_quota_hit(err.tenant)
+      Agent::Message.tool_result(ctx.tool_call, "Quota reached; tell the user.", is_error: true)
+    when Exception
+      Sentry.capture(err) # anything that isn't a ToolError
+      result
+    else
+      result
+    end
+  end
+end
+```
+
 ### Tool activation control
 
 You can register a tool as initially **disabled** — the definition is stored but not sent to the model until you `enable_tool`:
@@ -261,6 +301,7 @@ while msg.has_tool_calls?
     when "get_weather"
       result = fetch_weather(args["city"].to_s)
       Agent::Message.tool_result(tc, result)
+      # or, when the tool failed: tool_result(tc, "...", is_error: true)
     else
       Agent::Message.tool_result(tc, "Unknown tool: #{tc.name}")
     end
@@ -423,7 +464,7 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 |---|---|
 | `.stream { \|chunk\| }` | Yield each delta as it arrives from the API |
 | `.message` | Block until the final `Message` is ready, then return it |
-| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage |
+| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage. `cached_tokens` and `cache_creation_tokens` say how much of the prompt the provider's cache served or stored, when it reports that |
 | `.join` | Block until both message and metadata are ready |
 | `.finished?` | Poll whether the response is complete |
 | `.error?` | Whether the response represents a failed request |
@@ -443,6 +484,8 @@ msg.tool_calls     # Array(ToolCall)? — function calls from the model
 msg.tool_call_id   # String? — id for tool result messages
 msg.content_parts  # Array(ContentPart)? — multimodal parts (text + images)
 msg.has_tool_calls? # Bool — convenience check
+msg.is_error       # Bool? — on a tool result: the tool failed (set by the loop for its own errors)
+msg.provider_data  # JSON::Any? — opaque data a custom provider keeps to replay the message
 ```
 
 ---
@@ -464,6 +507,7 @@ Agent::Config.new(
   extra_headers:      Hash(String, String)?, # optional extra HTTP headers
   max_tool_iterations: Int32?,             # default: 100 — safety limit for tool loops
   prompt_cache_key:   String?,             # optional explicit prompt cache key
+  include_usage:      Bool,                # default: true — ask for token counts on streamed completions
   *,
   # Per-read SSE timeouts (fail-fast on hung connections):
   first_byte_timeout_min:          Time::Span | Int32 = 60,  # TTFT floor (seconds or span)
@@ -531,6 +575,7 @@ Error types:
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
 | `Agent::IdleTimeoutError` | Provider stream stuck — no bytes within the first-byte or idle per-read timeout (`phase = :first_byte` or `:idle`, `timeout = Time::Span`) |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |
+| `Agent::ToolError` | Raised by a tool callback: its message is shown to the model (not a response error) |
 | `Agent::SessionLoadError` | Loading a saved session failed due to corrupt or missing fields |
 | `Agent::ClosedError` | An operation was attempted on a closed agent |
 

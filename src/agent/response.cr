@@ -171,6 +171,23 @@ class Agent
       end
     rescue Channel::ClosedError
       # streaming finished
+    ensure
+      stop_streaming
+    end
+
+    # A consumer that leaves #stream early (break, or an exception such as a
+    # disconnected client) must not leave the agent fiber blocked on a full
+    # buffer: stop accepting chunks and drain what is queued.
+    private def stop_streaming : Nil
+      synchronize { @streaming = false }
+      loop do
+        select
+        when chunk = @chunk_channel.receive?
+          break if chunk.nil?
+        else
+          break
+        end
+      end
     end
 
     # Internal: push a chunk (safe to call from any fiber).
@@ -213,8 +230,9 @@ class Agent
 
     # Internal: signal that the response failed with an error.
     # Stores the error and sends an error message through the normal channels
-    # so consumers can still call #message.
-    def finish_with_error(err : Agent::Error) : Nil
+    # so consumers can still call #message. `usage` is what the turn's
+    # provider calls consumed before the failure.
+    def finish_with_error(err : Agent::Error, usage : Usage = Usage.new) : Nil
       error_msg = Message.new(role: Role::Assistant, content: "Agent error: #{err.message}")
 
       synchronize do
@@ -222,10 +240,10 @@ class Agent
         @done = true
         @error = err
         @message = error_msg
-        @metadata = Usage.new
+        @metadata = usage
       end
       @message_channel.send(error_msg)
-      @usage_channel.send(Usage.new)
+      @usage_channel.send(usage)
     ensure
       @chunk_handler = nil
       @chunk_channel.close

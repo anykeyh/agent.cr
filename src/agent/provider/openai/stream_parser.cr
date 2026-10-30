@@ -47,7 +47,7 @@ class Agent
 
         def route(tcd : Hash(String, JSON::Any)) : ToolCallDelta
           id = tcd["id"]?.try(&.as_s?)
-          index = tcd["index"]?.try(&.as_i)
+          index = tcd["index"]?.try(&.as_i?)
 
           key = if id && !id.empty?
                   route_by_id(id, index)
@@ -266,16 +266,18 @@ class Agent
         private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
           if usage_data = parsed["usage"]?
             if u = usage_data.as_h?
+              cached = u["prompt_tokens_details"]?.try(&.as_h?).try(&.["cached_tokens"]?).try(&.as_i?)
               return Usage.new(
-                prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
-                completion_tokens: u["completion_tokens"]?.try(&.as_i),
-                total_tokens: u["total_tokens"]?.try(&.as_i)
+                prompt_tokens: u["prompt_tokens"]?.try(&.as_i?),
+                completion_tokens: u["completion_tokens"]?.try(&.as_i?),
+                total_tokens: u["total_tokens"]?.try(&.as_i?),
+                cached_tokens: cached,
               )
             end
           elsif timings = parsed["timings"]?
             if timings_h = timings.as_h?
-              prompt_n = timings_h["prompt_n"]?.try(&.as_i)
-              predicted_n = timings_h["predicted_n"]?.try(&.as_i)
+              prompt_n = timings_h["prompt_n"]?.try(&.as_i?)
+              predicted_n = timings_h["predicted_n"]?.try(&.as_i?)
               return Usage.new(
                 prompt_tokens: prev_usage.prompt_tokens || prompt_n,
                 completion_tokens: prev_usage.completion_tokens || predicted_n,

@@ -28,6 +28,13 @@ class Agent
     end
   end
 
+  # Raise from a tool callback to show the model why the tool failed. Its
+  # message goes into the tool result verbatim; any other exception is
+  # logged and the model sees only that the tool failed, so internal
+  # details (SQL errors, hosts, tokens) never reach it.
+  class ToolError < Error
+  end
+
   # Raised when the caller cancels an in-flight response.
   class CancelledError < Error
     def initialize

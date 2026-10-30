@@ -23,9 +23,13 @@ class Agent
 
   # Mutable context for a single tool call, before execution.
   # `response` is provided so a handler can cancel the in-flight request.
+  # After `next_proc` returns, `error` holds the exception the callback
+  # raised, if any: a handler can record it, or match on an `Agent::ToolError`
+  # subclass and return a different result for the model.
   class ToolCallContext
     property tool_call : ToolCall
     property response : Response
+    property error : Exception?
 
     def initialize(@tool_call, @response)
     end

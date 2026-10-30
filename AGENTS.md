@@ -189,7 +189,7 @@ transfers control to the agent fiber. No explicit `Fiber.yield` is needed.
 *before* closing `chunk_channel`. Additionally:
 - `finish` captures the `finish_reason` from the API ("stop", "length",
   "tool_calls", etc.) exposed as `Response#finish_reason`.
-- `finish_with_error` (response.cr L158-168) stores an `Agent::Error` and
+- `finish_with_error` stores an `Agent::Error` and
   sends a synthetic error message so `#message` always unblocks.
 
 This ordering matters:
@@ -219,7 +219,7 @@ failure), the error is caught in `http_post_stream`'s own rescue block, which
 calls `response.finish_with_error` with an `Agent::Error`. This ensures
 `#message` and `#join` always unblock. A `CancelledError` is raised when
 the caller calls `#cancel` on the response — the HTTP fiber checks the
-cancel channel after each SSE line and aborts cleanly, calling
+cancel flag before each SSE line and aborts cleanly, calling
 `finish_with_error(CancelledError.new)`.
 
 ## Development workflow
@@ -362,10 +362,31 @@ flowchart TD
 
 ### Error handling in the loop
 
-- If any tool call has no registered handler, the loop breaks and returns
-  the tool-call message to the caller — same as manual dispatch.
-- If `http_post_stream` raises, the error message is returned and the loop
-  exits (no retry).
+- A call to an unregistered or disabled tool gets an error result and the
+  loop continues. If a call names a per-request tool (`ask(tools:)`) that is
+  not an enabled registered one, nothing runs and the whole message goes
+  back to the caller (manual dispatch).
+- At the start of each turn, any tool call left without a result (the
+  caller skipped the follow-up, or a turn failed midway) gets an error
+  result, so history is always a valid request.
+- If `http_post_stream` fails, the response finishes with the error and the
+  turn's usage so far, and the loop exits (no retry). A failed first call
+  rolls the turn back; a later failure keeps it, since tools have run.
+- Any other exception escaping the loop (a handler, the provider) finishes
+  the response with it instead of killing the fiber. A `Handler` can
+  therefore raise an `Agent::Error` to stop a turn.
+- Every failure rebuilds the HTTP client, since an unread body on the
+  kept-alive connection would corrupt the next request.
+- A consumer that leaves `#stream` early stops the stream instead of
+  blocking the fiber.
+- `Response#cancel` is checked between SSE lines, so a request still
+  waiting on the provider (headers, first byte) is cancelled only when a
+  byte arrives or the read times out. Closing the socket from the caller's
+  fiber would wake it, but on TLS that re-enters OpenSSL mid-read.
+- Only an `Agent::ToolError`'s message reaches the model; other exceptions
+  from tool callbacks are logged and reported as "the tool failed". Either
+  way the exception is on `ToolCallContext#error` for handlers, which can
+  replace the result the model sees.
 
 ### Tool argument validation
 
