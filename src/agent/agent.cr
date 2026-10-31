@@ -140,15 +140,14 @@ class Agent
   # Any pending or future #ask calls will get a closed-error response.
   # Safe to call multiple times.
   #
-  # NOTE: Do not call #close from inside a tool callback — if you need
-  # to stop the agent mid-callback, prefer response.cancel on the
-  # current Response. Calling #close from a tool callback will close
-  # the HTTP client underneath the in-flight request.
+  # A request in flight finishes its current provider call; the turn then
+  # ends with a closed error instead of continuing its tool loop. The agent
+  # fiber releases the HTTP client and provider as it exits: closing a TLS
+  # socket from here, while that fiber is mid-read on it, would re-enter
+  # OpenSSL.
   def close : Nil
     @state_mutex.synchronize { return if @closed; @closed = true }
     @request_channel.close
-    @http_client.close
-    @provider.close
   end
 
   # Send a user message and return a Response immediately.
@@ -419,6 +418,9 @@ class Agent
   rescue Channel::ClosedError
     # agent fiber exits on close — any fiber blocked in a send to the
     # request channel will also see ClosedError and raise to its caller.
+  ensure
+    @http_client.close
+    @provider.close
   end
 
   # Process a request with automatic tool resolution.
@@ -433,84 +435,139 @@ class Agent
     tools = request.tools
     max_iter = @config.max_tool_iterations
     iteration = 0
-
-    # Append new messages to history under the lock, then snapshot for the HTTP call.
-    history_snapshot = @history.lock do |h|
-      h.concat(request.new_messages)
-      h.dup
-    end
-    messages = build_messages(history_snapshot, [] of Message)
+    # History size before this turn, so a failed first call can be rolled back.
+    start_size : Int32? = nil
 
     # Accumulates each iteration's usage so `Response#metadata` reports the
     # whole turn — every provider call of the tool loop — not just the
-    # finishing iteration's counts.
+    # finishing iteration's counts. Reported on failure too.
     total_usage = Usage.new
 
-    loop do
-      iteration += 1
-
-      # Pre-flight bail-out checks (closed / cancelled / iteration limit).
-      # Returns true if the loop should break.
-      if preflight_bailout?(response, iteration, max_iter)
-        break
+    begin
+      # Append new messages to history under the lock, then snapshot for the HTTP call.
+      history_snapshot = @history.lock do |h|
+        close_dangling_tool_calls(h, request.new_messages)
+        start_size = h.size
+        h.concat(request.new_messages)
+        h.dup
       end
-
-      response.chunk_handler = ->(chunk : Response::Chunk) {
-        @handlers.decorate(ChunkContext.new(chunk), &.chunk)
-      }
-      msg, usage, finish_reason = http_post_stream(messages, tools, response)
-
-      # Cancellation is a user-initiated abort, not a failure: the partial
-      # assistant reply and the user's messages are real conversation context
-      # and must be preserved so the next #ask has continuity.
-      if response.cancelled?
-        handle_cancellation(msg, response)
-        break
-      end
-
-      # On a genuine error (network/API/JSON), http_post_stream already called
-      # response.finish_with_error. Roll back the user messages that were
-      # appended at the start of this request so history is not corrupted for
-      # subsequent #ask calls (the turn never produced a usable assistant reply).
-      if response.error?
-        @history.lock { |h| request.new_messages.each { h.pop } }
-        break
-      end
-
-      # Append the assistant message to history under the lock.
-      @history.lock { |h| h << msg }
-      total_usage = total_usage + usage
-
-      # Determine whether to auto-resolve tools (read under the lock).
-      has_registered_tools = @registered_tools.lock(&.empty?.!)
-
-      # If no tool calls, or auto_execute is disabled, or no registered tools — done.
-      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || !has_registered_tools
-      if no_tools
-        trim_history!
-        response.finish(msg, total_usage, finish_reason: finish_reason)
-        break
-      end
-
-      # ameba:disable Lint/NotNil
-      tool_calls = msg.tool_calls.not_nil!
-      results = execute_registered_tools(tool_calls, response)
-
-      # If some tools had no registered handler, stop and let the caller handle it.
-      # NOTE: The assistant(tool_calls) is already in @history. The caller MUST
-      # follow up with #ask(tool_results) so the tool messages follow the
-      # assistant(tool_calls) — otherwise the next API request will be invalid.
-      if results.empty?
-        trim_history!
-        response.finish(msg, total_usage, finish_reason: finish_reason)
-        break
-      end
-
-      # Append tool results to history under the lock, then rebuild messages for next iteration.
-      @history.lock(&.concat(results))
-      history_snapshot = @history.lock(&.dup)
       messages = build_messages(history_snapshot, [] of Message)
+
+      loop do
+        iteration += 1
+
+        # Pre-flight bail-out checks (closed / cancelled / iteration limit).
+        # Returns true if the loop should break.
+        if preflight_bailout?(response, iteration, max_iter, total_usage)
+          break
+        end
+
+        response.chunk_handler = ->(chunk : Response::Chunk) {
+          @handlers.decorate(ChunkContext.new(chunk), &.chunk)
+        }
+        msg, usage, finish_reason = http_post_stream(messages, tools, response, total_usage)
+        total_usage = total_usage + usage
+
+        # Cancellation is a user-initiated abort, not a failure: the partial
+        # assistant reply and the user's messages are real conversation context
+        # and must be preserved so the next #ask has continuity.
+        if response.cancelled?
+          handle_cancellation(msg, response, total_usage)
+          break
+        end
+
+        # On a genuine error (network/API/JSON), http_post_stream already called
+        # response.finish_with_error.
+        if response.error?
+          rollback_failed_turn(start_size, request.new_messages.size)
+          break
+        end
+
+        # Append the assistant message to history under the lock.
+        @history.lock { |h| h << msg }
+
+        # Done unless the loop runs this message's tools itself.
+        tool_calls = auto_tool_calls(msg, tools)
+        unless tool_calls
+          trim_history!
+          response.finish(msg, total_usage, finish_reason: finish_reason)
+          break
+        end
+
+        results = execute_registered_tools(tool_calls, response)
+
+        # Append tool results to history under the lock, then rebuild messages for next iteration.
+        @history.lock(&.concat(results))
+        history_snapshot = @history.lock(&.dup)
+        messages = build_messages(history_snapshot, [] of Message)
+      end
+    rescue ex
+      # Anything escaping the loop (a handler, a provider, a tool schema) must
+      # finish the response; an unhandled exception would kill this fiber and
+      # hang every caller.
+      Log.error(exception: ex) { "Agent: request failed" } unless ex.is_a?(Agent::Error)
+      err = ex.is_a?(Agent::Error) ? ex : Agent::Error.new(ex.message || ex.class.name, cause: ex)
+      rollback_failed_turn(start_size, request.new_messages.size) unless response.finished?
+      response.finish_with_error(err, total_usage)
     end
+  end
+
+  # A turn that fails before the model replied produced nothing: drop the
+  # messages it added. Once a reply is in history, tools may have run, so
+  # the turn is kept; any call left unanswered is answered at the start of
+  # the next turn.
+  private def rollback_failed_turn(start_size : Int32?, added : Int32) : Nil
+    return unless start_size
+    @history.lock { |h| h.pop(h.size - start_size) if start_size < h.size <= start_size + added }
+  end
+
+  # Give every tool call of the last assistant message that has no result
+  # (and none among `incoming`) an error result, so the next request is valid.
+  # This happens when a caller skips the #ask(tool_results) follow-up or a
+  # turn fails midway through its tools.
+  private def close_dangling_tool_calls(history : Array(Message), incoming : Array(Message)) : Nil
+    idx = history.rindex { |m| m.role == Role::Assistant } || return
+    calls = history[idx].tool_calls || return
+
+    pos = idx + 1
+    answered = Set(String).new
+    while pos < history.size && history[pos].role == Role::Tool
+      history[pos].tool_call_id.try { |id| answered << id }
+      pos += 1
+    end
+    incoming.each { |m| m.tool_call_id.try { |id| answered << id } if m.role == Role::Tool }
+
+    calls.each do |tc|
+      next if answered.includes?(tc.id)
+      history.insert(pos, Message.tool_result(tc, "Error: this tool call was not completed", is_error: true))
+      pos += 1
+    end
+  end
+
+  # The tool calls the loop should execute, or nil to hand the message back
+  # to the caller: no tool calls, auto-execution off, no registered tools,
+  # or a call to a tool passed to #ask(tools:) that is not an enabled
+  # registered one. Such a call is the caller's to dispatch, so the whole
+  # message goes back before anything runs; no registered tool runs and
+  # then has its result discarded.
+  # NOTE: The assistant(tool_calls) is already in @history. The caller
+  # should follow up with #ask(tool_results); any call left unanswered gets
+  # an error result at the start of the next turn.
+  private def auto_tool_calls(msg : Message, tools : Array(Tool)?) : Array(ToolCall)?
+    tool_calls = msg.tool_calls
+    return if tool_calls.nil? || tool_calls.empty? || !@config.auto_execute_tools?
+
+    enabled = @registered_tools.lock do |t|
+      next if t.empty?
+      t.select { |_, v| v[:enabled] }.keys.to_set
+    end
+    return unless enabled
+
+    if tools
+      request_names = tools.map(&.function.name).to_set
+      return if tool_calls.any? { |tc| request_names.includes?(tc.name) && !enabled.includes?(tc.name) }
+    end
+    tool_calls
   end
 
   # Preserve the canceled turn in history.
@@ -519,30 +576,35 @@ class Agent
   # content was streamed before the cancel is real conversation context and is
   # appended to history so the next #ask has continuity (the user's question
   # was already appended at the start of #process_request_loop and is kept).
-  # The response is then finished with a CancelledError.
-  private def handle_cancellation(partial_msg : Message, response : Response) : Nil
-    has_content = !partial_msg.content.nil? || !partial_msg.tool_calls.nil?
-    @history.lock { |h| h << partial_msg } if has_content
+  # Tool calls are dropped: they never ran, and their arguments may be cut
+  # off mid-stream. The response is then finished with a CancelledError.
+  private def handle_cancellation(partial_msg : Message, response : Response, usage : Usage) : Nil
+    kept = if partial_msg.has_tool_calls?
+             Message.new(role: Role::Assistant, content: partial_msg.content, reasoning: partial_msg.reasoning)
+           else
+             partial_msg
+           end
+    @history.lock { |h| h << kept } unless kept.content.nil?
     trim_history!
-    response.finish_with_error(CancelledError.new)
+    response.finish_with_error(CancelledError.new, usage)
   end
 
   # Checks performed at the top of each tool-resolution iteration.
   # Returns true (and finishes the response) if the loop should break.
-  private def preflight_bailout?(response : Response, iteration : Int32, max_iter : Int32?) : Bool
+  private def preflight_bailout?(response : Response, iteration : Int32, max_iter : Int32?, usage : Usage) : Bool
     if @state_mutex.synchronize { @closed }
-      response.finish_with_error(Agent::Error.new("Agent was closed"))
+      response.finish_with_error(Agent::Error.new("Agent was closed"), usage)
       return true
     end
 
     if response.cancelled?
-      response.finish_with_error(CancelledError.new)
+      response.finish_with_error(CancelledError.new, usage)
       return true
     end
 
     if max_iter && iteration > max_iter
-      err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
-      response.finish_with_error(ToolLoopError.new(max_iter, err_msg))
+      err_msg = "tool call iteration limit (#{max_iter}) exceeded"
+      response.finish_with_error(ToolLoopError.new(max_iter, err_msg), usage)
       return true
     end
 
@@ -550,62 +612,55 @@ class Agent
   end
 
   # Trim history to respect max_history config, applied only after a
-  # complete user—>assistant turn (not during intermediate tool-call steps).
+  # complete user->assistant turn (not during intermediate tool-call steps).
   #
-  # Trims in **turn units** so that tool messages are never orphaned:
-  # a "turn" is a user message followed by zero or more assistant + tool
-  # messages that belong to it. We drop complete turns from the front
-  # until the number of user+assistant messages is at most max*2.
+  # A turn is a user message and everything up to the next user message:
+  # the assistant's reply, and with tools, its tool-call messages and their
+  # results. The oldest turns are dropped whole until at most `max_history`
+  # remain, so the kept history always starts at a user message and no
+  # tool result is ever left without the assistant message that called it.
   private def trim_history! : Nil
     @history.replace do |h|
-      if (max = @config.max_history) && max > 0
-        # Count only User and Assistant messages (tool messages are auxiliary).
-        msg_count = h.count { |m| m.role == Role::User || m.role == Role::Assistant }
-        if msg_count > max * 2
-          # Walk forward to find how many messages to drop so that at most
-          # max*2 user+assistant messages remain. We track the index of the
-          # last message that would be dropped.
-          keep_count = msg_count - max * 2
-          kept = 0
-          drop_count = 0
+      max = @config.max_history
+      next h unless max && max > 0
 
-          h.each_with_index do |m, idx|
-            if kept >= keep_count
-              drop_count = idx
-              break
-            end
+      starts = [] of Int32
+      h.each_with_index { |m, idx| starts << idx if m.role == Role::User }
+      next h if starts.size <= max
 
-            if m.role == Role::User || m.role == Role::Assistant
-              kept += 1
-            end
-          end
-
-          if drop_count > 0
-            h[drop_count..]
-          else
-            h
-          end
-        else
-          h
-        end
-      else
-        h
-      end
+      first_kept = starts[starts.size - max]
+      h[first_kept..]
     end
   end
 
   # Execute all tool calls that have registered callbacks.
-  # Returns the array of tool-result messages. Returns an **empty** array if any
-  # tool call has no registered handler.
+  # Returns one tool-result message per call. A call to a tool that is not
+  # registered or is disabled (usually a hallucinated name) gets an error
+  # result so the model can correct itself.
   # If a callback raises, the error is caught and returned as a tool-result
-  # message with an error description, so the agent fiber never dies.
+  # message, so the agent fiber never dies. Only an `Agent::ToolError`'s
+  # message reaches the model; anything else is logged.
   private def execute_registered_tools(tool_calls : Array(ToolCall), response : Response) : Array(Message)
     results = [] of Message
 
     tool_calls.each do |tc|
+      # A cancel stops the remaining calls; each still gets a result so the
+      # history stays valid.
+      if response.cancelled?
+        results << Message.tool_result(tc, "Error: cancelled before this tool ran", is_error: true)
+        next
+      end
+
       entry = @registered_tools.lock { |t| t[tc.name]? }
       if entry.nil? || !entry[:enabled]
-        return [] of Message
+        results << Message.new(
+          role: Role::Tool,
+          content: "Error: tool '#{tc.name}' is not available",
+          tool_call_id: tc.id,
+          name: tc.name,
+          is_error: true,
+        )
+        next
       end
 
       # Parse the JSON arguments string into a hash for the callback.
@@ -618,6 +673,7 @@ class Agent
           content: "Error parsing arguments for tool '#{tc.name}': invalid JSON",
           tool_call_id: tc.id,
           name: tc.name,
+          is_error: true,
         )
         next
       end
@@ -631,19 +687,29 @@ class Agent
             content: "Error validating arguments for tool '#{tc.name}': #{errors.join("; ")}",
             tool_call_id: tc.id,
             name: tc.name,
+            is_error: true,
           )
           next
         end
       end
 
       result_msg = @handlers.decorate(ToolCallContext.new(tc, response)) do |ctx|
+        failed = false
         result = if cb = entry[:callback]
                    begin
                      cb.call(args_hash)
-                   rescue ex
+                   rescue ex : ToolError
+                     failed = true
+                     ctx.error = ex
                      "Error executing tool '#{ctx.tool_call.name}': #{ex.message}"
+                   rescue ex
+                     failed = true
+                     ctx.error = ex
+                     Log.error(exception: ex) { "Agent: tool '#{ctx.tool_call.name}' raised" }
+                     "Error executing tool '#{ctx.tool_call.name}': the tool failed"
                    end
                  else
+                   failed = true
                    "Error executing tool '#{ctx.tool_call.name}': no callback registered"
                  end
 
@@ -652,6 +718,7 @@ class Agent
           content: result,
           tool_call_id: ctx.tool_call.id,
           name: ctx.tool_call.name,
+          is_error: failed ? true : nil,
         )
       end
 
@@ -793,20 +860,41 @@ class Agent
     messages : Array(Message),
     tools : Array(Tool)?,
     response : Response,
+    turn_usage : Usage,
   ) : {Message, Usage, String?}
     @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
       all_tools = combined_tools(ctx.tools)
       req = @provider.build_request(ctx.messages, all_tools)
+      post_with_retries(req, response, turn_usage)
+    end
+  end
 
-      first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
+  # POST the request and parse its stream. A failure is retried up to
+  # `Config#max_retries` times with backoff, honouring `Retry-After`, when it
+  # is transient and no output has streamed yet; once it has, nothing is
+  # retried. A failure after the provider accepted the request (HTTP 200)
+  # is a StreamError, whatever broke.
+  private def post_with_retries(
+    req : NamedTuple(path: String, headers: HTTP::Headers, body: String),
+    response : Response,
+    turn_usage : Usage,
+  ) : {Message, Usage, String?}
+    first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
+    attempt = 0
+
+    loop do
       client = @http_client
       partial_msg = nil
+      accepted = false
+      chunks_before = response.chunks_pushed
 
       begin
-        client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
-          unless http_resp.status.ok?
-            raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
-          end
+        raise CancelledError.new if response.cancelled?
+
+        return client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
+          raise api_error(http_resp) unless http_resp.status.ok?
+          accepted = true
+          raise json_instead_of_stream(http_resp) if json_body?(http_resp)
 
           msg, usage, finish_reason = @provider.parse_stream(
             http_resp.body_io,
@@ -827,9 +915,106 @@ class Agent
           {msg, usage, finish_reason}
         end
       rescue ex
-        handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout)
+        ex = stream_failure(ex) if accepted
+        # Retry only while this call has shown nothing; an earlier call of
+        # the tool loop may have.
+        output = response.chunks_pushed != chunks_before
+        delay = retry_delay(ex, attempt) unless output || response.cancelled?
+        return handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout, turn_usage) unless delay
+
+        attempt += 1
+        rebuild_http_client
+        wait_unless_cancelled(delay, response)
       end
     end
+  end
+
+  # A failure once the request was accepted, as a StreamError: the socket
+  # dropping (plain or TLS) is transient, anything else (a malformed stream)
+  # is not. Agent errors, and timeouts, keep their own type.
+  private def stream_failure(ex : Exception) : Exception
+    case ex
+    when Agent::Error, IO::TimeoutError
+      ex
+    when IO::Error, OpenSSL::Error
+      StreamError.new("connection lost during the stream: #{ex.message}", cause: ex, retryable: true)
+    else
+      StreamError.new("could not read the stream: #{ex.message || ex.class.name}", cause: ex)
+    end
+  end
+
+  # How long to wait before retrying after `ex`, or nil to give up. A
+  # `Retry-After` longer than `Config#retry_max_delay` is not waited out.
+  private def retry_delay(ex : Exception, attempt : Int32) : Time::Span?
+    return if attempt >= @config.max_retries
+    return unless retryable?(ex)
+
+    if ex.is_a?(ApiError) && (wait = ex.retry_after)
+      return wait <= @config.retry_max_delay ? wait : nil
+    end
+    backoff = @config.retry_base_delay * (2 ** attempt) * Random.rand(0.5..1.0)
+    backoff < @config.retry_max_delay ? backoff : @config.retry_max_delay
+  end
+
+  # Connection errors are transient. Of timeouts, only connecting is: a
+  # provider slow to answer is not retried, since that doubles an already
+  # long wait. Of TLS errors, only a session the peer cut off: a bad
+  # certificate fails the same way again.
+  private def retryable?(ex : Exception) : Bool
+    case ex
+    when ApiError, StreamError then ex.retryable?
+    when IO::TimeoutError      then ex.message.try(&.downcase.starts_with?("connect timed out")) || false
+    when IO::Error             then true
+    when OpenSSL::SSL::Error   then ex.underlying_eof?
+    else                            false
+    end
+  end
+
+  private def wait_unless_cancelled(delay : Time::Span, response : Response) : Nil
+    deadline = Time.instant + delay
+    while !response.cancelled? && (left = deadline - Time.instant) > Time::Span.zero
+      sleep(left < 50.milliseconds ? left : 50.milliseconds)
+    end
+  end
+
+  # An ApiError for a non-2xx response, with the start of its body, its
+  # headers, and the provider's error message when the body has one.
+  private def api_error(http_resp : HTTP::Client::Response) : ApiError
+    body = IO::Memory.new
+    if io = http_resp.body_io?
+      begin
+        IO.copy(io, body, ApiError::BODY_LIMIT)
+      rescue IO::Error
+        # keep what was read
+      end
+    end
+    text = body.to_s
+
+    message = "#{http_resp.status_code} #{http_resp.status_message}"
+    if detail = provider_error_message(text)
+      message += ": #{detail}"
+    end
+    ApiError.new(http_resp.status_code, message, body: text.presence, headers: http_resp.headers)
+  end
+
+  # Some gateways answer a streaming request with a 200 and a JSON error
+  # body instead of an event stream.
+  private def json_body?(http_resp : HTTP::Client::Response) : Bool
+    http_resp.headers["Content-Type"]?.try(&.downcase.starts_with?("application/json")) || false
+  end
+
+  private def json_instead_of_stream(http_resp : HTTP::Client::Response) : StreamError
+    text = String.build { |io| http_resp.body_io?.try { |b| IO.copy(b, io, ApiError::BODY_LIMIT) } }
+    detail = provider_error_message(text) || "no event stream"
+    StreamError.new("provider replied with JSON instead of a stream: #{detail}")
+  end
+
+  # `error.message` from an OpenAI-style JSON error body.
+  private def provider_error_message(text : String) : String?
+    error = JSON.parse(text).as_h?.try(&.["error"]?) || return
+    error.as_s? || error.as_h?.try(&.["message"]?).try(&.as_s?)
+  rescue JSON::ParseException
+    nil
   end
 
   # Centralised error handler for #http_post_stream. Dispatches on the
@@ -844,39 +1029,45 @@ class Agent
     partial_msg : Message?,
     first_byte_timeout : Time::Span?,
     idle_timeout : Time::Span,
+    turn_usage : Usage,
   ) : {Message, Usage, String?}
+    # Every failure can leave an unread body (an API error's JSON, a
+    # half-read stream) on the kept-alive connection, which the next request
+    # would read as its response ("Unsupported HTTP version: {...").
+    rebuild_http_client
+
+    # A failure racing a cancel is the cancel; nothing streamed is kept.
+    if response.cancelled? && !ex.is_a?(CancelledError)
+      ex = CancelledError.new
+      partial_msg ||= Message.new(role: Role::Assistant)
+    end
+
     case ex
-    when ApiError
-      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-      response.finish_with_error(err)
-      error_tuple(err)
     when CancelledError, IdleTimeoutError
-      # Cancellation / per-read SSE timeout was already wrapped by the parser
-      # for the idle case, or raised here directly for cancellation. Either
-      # leaves the persistent HTTP connection with an unconsumed/partial
-      # response body, which would corrupt the next request on the same client
-      # ("Invalid HTTP response"). Discard and build a fresh one.
-      rebuild_http_client
       err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-      response.finish_with_error(err)
+      response.finish_with_error(err, turn_usage)
       error_tuple(err, partial_msg)
     when IO::TimeoutError
       # Defensive fallback: the parser wraps its IO reads and raises
       # IdleTimeoutError directly, but other IO operations in this shim (eg.
       # request body upload) might still raise IO::TimeoutError. Recover the
       # same way as IdleTimeoutError with phase inferred from partial_msg.
-      rebuild_http_client
       phase = partial_msg.nil? ? :first_byte : :idle
       err = @handlers.decorate(ErrorContext.new(ex)) do |c|
         IdleTimeoutError.new(phase, first_byte_timeout || idle_timeout, cause: c.error)
       end
-      response.finish_with_error(err)
+      response.finish_with_error(err, turn_usage)
       error_tuple(err, partial_msg)
+    when Agent::Error
+      # ApiError, StreamError, or one a handler raised: passed through.
+      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+      response.finish_with_error(err, turn_usage)
+      error_tuple(err)
     else
       err = @handlers.decorate(ErrorContext.new(ex)) do |c|
         ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
       end
-      response.finish_with_error(err)
+      response.finish_with_error(err, turn_usage)
       error_tuple(err)
     end
   end

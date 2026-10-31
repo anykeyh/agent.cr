@@ -17,6 +17,10 @@ class Agent
     # Explicit prompt cache key. If nil, Agent auto-generates one as
     # "agent-cr:<16-char-hex>" from its own session_id.
     getter prompt_cache_key : String?
+    # Ask the provider for token counts on streamed completions
+    # (`stream_options: {include_usage: true}` for OpenAI-compatible APIs).
+    # On by default; off for a server that rejects the field.
+    getter? include_usage : Bool
 
     # --- Per-read SSE timeout knobs ---
     # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
@@ -39,6 +43,15 @@ class Agent
     # read and subsequent reads fall back to `idle_byte_timeout`.
     getter? compute_first_byte_timeout : Bool
 
+    # Retries of a model call that fails transiently before it streamed any
+    # output (connection error, 408/409/429/5xx, a cut-off stream). 0 turns
+    # retrying off.
+    getter max_retries : Int32
+    # First backoff; it doubles per retry, with jitter.
+    getter retry_base_delay : Time::Span
+    # Longest wait before a retry. A `Retry-After` beyond it isn't retried.
+    getter retry_max_delay : Time::Span
+
     # Cached parsed URI — computed once at construction.
     getter parsed_uri : URI
 
@@ -56,6 +69,7 @@ class Agent
       @extra_headers : Hash(String, String)? = nil,
       @max_tool_iterations : Int32? = 100,
       @prompt_cache_key : String? = nil,
+      @include_usage : Bool = true,
       *,
       first_byte_timeout_min : Time::Span | Int32 = 60,
       first_byte_timeout_max : Time::Span | Int32 = 300,
@@ -63,6 +77,9 @@ class Agent
       @first_byte_timeout_ms_per_token : Int32 = 3,
       idle_byte_timeout : Time::Span | Int32 = 60,
       @compute_first_byte_timeout : Bool = true,
+      @max_retries : Int32 = 2,
+      retry_base_delay : Time::Span | Int32 = 1,
+      retry_max_delay : Time::Span | Int32 = 30,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)
@@ -80,6 +97,9 @@ class Agent
       @first_byte_timeout_base = parse_timeout(first_byte_timeout_base) || 3.seconds
       @idle_byte_timeout = parse_timeout(idle_byte_timeout) || 60.seconds
       validate_first_byte_timeout_bounds
+      raise ArgumentError.new("max_retries must be non-negative, got #{@max_retries}") if @max_retries < 0
+      @retry_base_delay = parse_timeout(retry_base_delay) || 1.second
+      @retry_max_delay = parse_timeout(retry_max_delay) || 30.seconds
 
       # Validate and parse the endpoint URI
       @parsed_uri = URI.parse(@api_endpoint)

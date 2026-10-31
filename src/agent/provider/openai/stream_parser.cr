@@ -47,7 +47,7 @@ class Agent
 
         def route(tcd : Hash(String, JSON::Any)) : ToolCallDelta
           id = tcd["id"]?.try(&.as_s?)
-          index = tcd["index"]?.try(&.as_i)
+          index = tcd["index"]?.try(&.as_i?)
 
           key = if id && !id.empty?
                   route_by_id(id, index)
@@ -156,6 +156,7 @@ class Agent
           reasoning_buffer = String::Builder.new
           usage = Usage.new
           finish_reason = nil
+          done = false
           read_count = 0
 
           # Apply per-read timeouts to the IO when it supports them. Real
@@ -189,6 +190,7 @@ class Agent
             end
             break if line.nil? # EOF
             read_count += 1
+            done ||= done_line?(line)
 
             # Switch to the idle (inter-byte) budget for subsequent reads.
             # Any byte arrival — including comment lines like
@@ -209,6 +211,7 @@ class Agent
             )
           end
 
+          check_finished(finish_reason, done, cancel)
           final_message = build_final_message(content_buffer, reasoning_buffer, tool_calls.deltas)
           {final_message, usage, finish_reason}
         end
@@ -234,7 +237,7 @@ class Agent
 
           # SSE sentinel — skip [DONE] (with or without space after data:)
           rest = line[5..].lstrip(' ')
-          return {usage, finish_reason} if rest.starts_with?("[DONE]")
+          return {usage, finish_reason} if done_line?(line)
 
           json = begin
             JSON.parse(rest)
@@ -244,9 +247,46 @@ class Agent
           parsed = json.as_h?
           return {usage, finish_reason} unless parsed
 
+          raise_stream_error(parsed)
           new_usage = parse_usage(parsed, usage)
           new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_calls) || finish_reason
           {new_usage, new_finish}
+        end
+
+        # A stream that just stops, with neither a finish reason nor [DONE],
+        # was cut off (dropped connection, crashed upstream): the reply is
+        # incomplete and must not pass for a finished one.
+        private def check_finished(finish_reason : String?, done : Bool, cancel : -> Bool) : Nil
+          return if finish_reason || done || cancel.call
+          raise StreamError.new("stream ended before the model finished", retryable: true)
+        end
+
+        private def done_line?(line : String) : Bool
+          line = line.strip
+          line.starts_with?("data:") && line[5..].lstrip(' ').starts_with?("[DONE]")
+        end
+
+        # Providers report a failure that happens after the stream started
+        # (OpenRouter: upstream error, moderation) as an event carrying an
+        # `error` object, and a finish_reason of "error".
+        private def raise_stream_error(parsed : Hash(String, JSON::Any)) : Nil
+          if (error = parsed["error"]?) && !error.raw.nil?
+            raise error_event(error)
+          end
+
+          choices = parsed["choices"]?.try(&.as_a?) || return
+          if choices.any? { |c| c.as_h?.try(&.["finish_reason"]?).try(&.as_s?) == "error" }
+            raise StreamError.new("provider ended the stream with an error", retryable: true)
+          end
+        end
+
+        # A StreamError for a provider `error` value: a string, or an object
+        # with `message` and a numeric or string `code` (or `type`).
+        def error_event(error : JSON::Any) : StreamError
+          h = error.as_h?
+          message = error.as_s? || h.try(&.["message"]?).try(&.as_s?) || "unknown error"
+          code = h.try { |e| e["code"]? || e["type"]? }.try { |c| c.as_s? || c.as_i?.try(&.to_s) }
+          StreamError.new("provider error in stream: #{message}", code)
         end
 
         # Best-effort per-read timeout application. Uses runtime dispatch
@@ -266,16 +306,18 @@ class Agent
         private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
           if usage_data = parsed["usage"]?
             if u = usage_data.as_h?
+              cached = u["prompt_tokens_details"]?.try(&.as_h?).try(&.["cached_tokens"]?).try(&.as_i?)
               return Usage.new(
-                prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
-                completion_tokens: u["completion_tokens"]?.try(&.as_i),
-                total_tokens: u["total_tokens"]?.try(&.as_i)
+                prompt_tokens: u["prompt_tokens"]?.try(&.as_i?),
+                completion_tokens: u["completion_tokens"]?.try(&.as_i?),
+                total_tokens: u["total_tokens"]?.try(&.as_i?),
+                cached_tokens: cached,
               )
             end
           elsif timings = parsed["timings"]?
             if timings_h = timings.as_h?
-              prompt_n = timings_h["prompt_n"]?.try(&.as_i)
-              predicted_n = timings_h["predicted_n"]?.try(&.as_i)
+              prompt_n = timings_h["prompt_n"]?.try(&.as_i?)
+              predicted_n = timings_h["predicted_n"]?.try(&.as_i?)
               return Usage.new(
                 prompt_tokens: prev_usage.prompt_tokens || prompt_n,
                 completion_tokens: prev_usage.completion_tokens || predicted_n,

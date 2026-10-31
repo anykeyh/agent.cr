@@ -2,6 +2,114 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- History trimming drops whole turns. A turn is a user message and
+  everything up to the next one, so `max_history` now counts conversation
+  turns as documented, the kept history always starts at a user message,
+  and a tool result is never left without the assistant message that called
+  it (previously a tool-call turn could be cut in the middle, and the next
+  request rejected by the API).
+- Streamed completions report token counts: the OpenAI provider sends
+  `stream_options: {include_usage: true}`, without which OpenAI, Ollama,
+  vLLM and others return no `usage` on a stream and `Response#metadata` was
+  all nil. `Agent::Config.new(include_usage: false)` turns it off for a
+  server that rejects the field.
+- An API error with a body (429, 400, 500) no longer breaks the next
+  request on the agent. The unread body stayed on the kept-alive connection
+  and was read as the next response (`Unsupported HTTP version: {...`). The
+  HTTP client is now rebuilt after every failure.
+- A consumer that leaves `Response#stream` early (`break`, or an exception
+  such as a disconnected client) no longer blocks the agent fiber forever
+  once 256 chunks are queued.
+- A call to an unregistered or disabled tool gets an error result and the
+  loop continues. Before, the whole message went back to the caller after
+  the registered tools in it had already run, discarding their results and
+  leaving history that the API rejects. A message that calls a per-request
+  tool still goes back to the caller, now before any tool runs.
+- Tool calls left without a result (no `ask(tool_results)` follow-up, or a
+  turn that failed midway) are answered with an error result at the start
+  of the next turn instead of making every later request fail.
+- A provider call failing after the first call of a tool loop no longer
+  removes the last tool result from history; the turn is kept. The
+  response's `metadata` reports the usage of the calls that succeeded, on
+  every error and on cancel, instead of nothing.
+- A cancelled turn drops the tool calls it streamed instead of keeping them
+  in history without results.
+- An exception from a `Handler` or the provider finishes the response with
+  that error. Before, it killed the agent fiber, and every later `#ask` hung.
+- A `null` token count or tool-call `index` in the stream no longer fails
+  the request.
+- `Agent#close` no longer closes the HTTP client under a request in flight.
+  On TLS that shut down the session while the agent fiber was mid-read on
+  it. The call in flight now finishes, the turn ends with a closed error
+  instead of continuing its tool loop, and the agent fiber releases the
+  client and provider as it exits.
+- A stream that fails after it started no longer reads as a success. An
+  error event inside the stream (OpenRouter sends these), a stream that
+  ends with neither a finish reason nor `[DONE]`, or a 200 with a JSON
+  body instead of a stream now finishes the response with
+  `Agent::StreamError`. Before, the partial reply passed for a complete one.
+- Every failure after the provider accepted the request (HTTP 200) is now
+  an `Agent::StreamError`, whatever broke. A connection dropped mid-stream
+  used to be a `ConnectionError`, and a malformed stream was misreported as
+  one too.
+- `IdleTimeoutError` and `ToolLoopError` messages no longer start with
+  "Agent error: Agent error:".
+- An `Agent::Error` raised by a chunk handler reaches the response as is,
+  instead of being wrapped in a `ConnectionError`.
+- A cancel now stops a tool loop before its next tool call, not only before
+  the next model call. Each skipped call gets an error result.
+- Chunks pushed before `Response#stream` was called are no longer dropped.
+  They queue until `#stream` starts, without blocking the agent fiber.
+  Chunk handlers now see every chunk, whether or not anyone streams.
+- A tool callback's exception message no longer reaches the model. It is
+  logged, and the model sees `Error executing tool 'x': the tool failed`.
+  Raise `Agent::ToolError` for a message the model should see.
+
+### Added
+
+- Retries: a model call that fails transiently before it streamed any
+  output is retried up to `Config#max_retries` times (default 2) with
+  jittered exponential backoff (`retry_base_delay`, default 1 s), honouring
+  `Retry-After` (seconds or a date) and `retry-after-ms` up to
+  `retry_max_delay` (default 30 s). Transient means a connection error or
+  connect timeout, a TLS session cut off, a 408/409/429/5xx (or what the
+  provider's `x-should-retry` header says), or a stream error with such a
+  code, cut off, or ended by an error before its first chunk. Once a call
+  has streamed output, nothing is retried, as in the OpenAI and Anthropic
+  SDKs.
+- `ApiError#body`, `#headers`, `#request_id`, `#retry_after` and
+  `#retryable?`. Its message now includes the provider's error message
+  (`"429 Too Many Requests: Rate limit reached"`).
+- `Agent::StreamError` (with `#code`, `#retryable?` and the original
+  exception as `#cause`), for a request accepted with a 200 whose stream
+  then failed.
+- `Response#partial?`: the response failed after output had streamed, so
+  what the caller showed is an incomplete reply. `#output_started?` says
+  whether any chunk was produced.
+- `Agent::ToolError`: raise it from a tool callback to show the model why
+  the tool failed.
+- `ToolCallContext#error`: the exception a tool callback raised, set when
+  `next_proc` returns. A handler can record it, or match on a `ToolError`
+  subclass carrying its own fields and return a different result for the
+  model.
+
+- `Usage#cached_tokens` and `Usage#cache_creation_tokens`: the prompt
+  tokens served from the provider's prompt cache and written to it. The
+  OpenAI parser fills `cached_tokens` from `prompt_tokens_details`; both
+  sum with `+` like the other fields.
+- `Message#is_error` on tool results (`Message.tool_result(tc, text,
+  is_error: true)`, `Message#error?`). The agent loop sets it on the
+  results it builds for a tool that raised, had no callback, or whose
+  arguments failed to parse or validate. The OpenAI wire format has no such
+  flag and ignores it; a custom provider whose format does (Anthropic's
+  `tool_result` block) can send it.
+- `Message#provider_data : JSON::Any?`: an opaque slot for what a custom
+  provider needs to replay a message exactly (signed reasoning blocks,
+  citations). Kept through `dump`/`load`, compared by `==`, never sent by
+  the OpenAI provider.
+
 ## [0.2.0] - 2026-10-19
 
 ### Fixed
