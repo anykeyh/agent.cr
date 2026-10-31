@@ -45,12 +45,49 @@
   it. The call in flight now finishes, the turn ends with a closed error
   instead of continuing its tool loop, and the agent fiber releases the
   client and provider as it exits.
+- A stream that fails after it started no longer reads as a success. An
+  error event inside the stream (OpenRouter sends these), a stream that
+  ends with neither a finish reason nor `[DONE]`, or a 200 with a JSON
+  body instead of a stream now finishes the response with
+  `Agent::StreamError`. Before, the partial reply passed for a complete one.
+- Every failure after the provider accepted the request (HTTP 200) is now
+  an `Agent::StreamError`, whatever broke. A connection dropped mid-stream
+  used to be a `ConnectionError`, and a malformed stream was misreported as
+  one too.
+- `IdleTimeoutError` and `ToolLoopError` messages no longer start with
+  "Agent error: Agent error:".
+- An `Agent::Error` raised by a chunk handler reaches the response as is,
+  instead of being wrapped in a `ConnectionError`.
+- A cancel now stops a tool loop before its next tool call, not only before
+  the next model call. Each skipped call gets an error result.
+- Chunks pushed before `Response#stream` was called are no longer dropped.
+  They queue until `#stream` starts, without blocking the agent fiber.
+  Chunk handlers now see every chunk, whether or not anyone streams.
 - A tool callback's exception message no longer reaches the model. It is
   logged, and the model sees `Error executing tool 'x': the tool failed`.
   Raise `Agent::ToolError` for a message the model should see.
 
 ### Added
 
+- Retries: a model call that fails transiently before it streamed any
+  output is retried up to `Config#max_retries` times (default 2) with
+  jittered exponential backoff (`retry_base_delay`, default 1 s), honouring
+  `Retry-After` (seconds or a date) and `retry-after-ms` up to
+  `retry_max_delay` (default 30 s). Transient means a connection error or
+  connect timeout, a TLS session cut off, a 408/409/429/5xx (or what the
+  provider's `x-should-retry` header says), or a stream error with such a
+  code, cut off, or ended by an error before its first chunk. Once a call
+  has streamed output, nothing is retried, as in the OpenAI and Anthropic
+  SDKs.
+- `ApiError#body`, `#headers`, `#request_id`, `#retry_after` and
+  `#retryable?`. Its message now includes the provider's error message
+  (`"429 Too Many Requests: Rate limit reached"`).
+- `Agent::StreamError` (with `#code`, `#retryable?` and the original
+  exception as `#cause`), for a request accepted with a 200 whose stream
+  then failed.
+- `Response#partial?`: the response failed after output had streamed, so
+  what the caller showed is an incomplete reply. `#output_started?` says
+  whether any chunk was produced.
 - `Agent::ToolError`: raise it from a tool callback to show the model why
   the tool failed.
 - `ToolCallContext#error`: the exception a tool callback raised, set when

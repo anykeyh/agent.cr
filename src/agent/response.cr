@@ -9,11 +9,17 @@ class Agent
   #   - `chunk_channel` (size 256): legitimate stream queue with backpressure.
   #   - `message_channel` (size 1) and `usage_channel` (size 1): legitimate
   #     one-shot futures for the final message and usage metadata.
-  #   - Shared flags (@done, @cancelled, @streaming, @finish_reason, @error)
+  #   - Shared flags (@done, @cancelled, @stream_state, @finish_reason, @error)
   #     are protected by a Mutex. The old `cancel_channel` (unconsumed) has
   #     been removed in favor of a mutex-protected bool.
   class Response
     CHUNK_BUFFER = 256
+
+    private enum StreamState
+      Waiting
+      Streaming
+      Left
+    end
 
     # Tags a streamed chunk with its origin.
     enum ChunkKind
@@ -75,7 +81,12 @@ class Agent
     @mutex : Sync::Mutex
     @done = false
     @cancelled = false
-    @streaming = false
+    # Waiting: nobody has called #stream yet, so chunks queue in @backlog.
+    # Streaming: chunks go to the channel. Left: the consumer left early,
+    # so chunks are dropped.
+    @stream_state = StreamState::Waiting
+    @backlog = [] of Chunk
+    @chunks_pushed = 0_i64
     @finish_reason : String?
     @error : Agent::Error?
     @chunk_handler : (Chunk -> Chunk)?
@@ -133,6 +144,23 @@ class Agent
       synchronize { !@error.nil? }
     end
 
+    # True once any chunk (content, reasoning, tool call) has been produced
+    # for this response, by any model call of the turn.
+    def output_started? : Bool
+      chunks_pushed > 0
+    end
+
+    # True when the response failed or was cancelled after output started:
+    # what was streamed is an incomplete reply, which a UI should mark.
+    def partial? : Bool
+      synchronize { !@error.nil? && @chunks_pushed > 0 }
+    end
+
+    # Internal: chunks produced so far, across every model call of the turn.
+    def chunks_pushed : Int64
+      synchronize { @chunks_pushed }
+    end
+
     # Return the fully assembled message (blocks until ready).
     def message : Message
       @message ||= begin
@@ -164,7 +192,11 @@ class Agent
     # Yields each chunk as it arrives from the API.
     # Use `chunk.text` for the string and `chunk.kind` for its origin.
     def stream(& : Chunk -> _) : Nil
-      synchronize { @streaming = true }
+      backlog = synchronize do
+        @stream_state = StreamState::Streaming
+        @backlog.tap { @backlog = [] of Chunk }
+      end
+      backlog.each { |chunk| yield chunk }
       loop do
         chunk = @chunk_channel.receive
         yield chunk
@@ -179,7 +211,7 @@ class Agent
     # disconnected client) must not leave the agent fiber blocked on a full
     # buffer: stop accepting chunks and drain what is queued.
     private def stop_streaming : Nil
-      synchronize { @streaming = false }
+      synchronize { @stream_state = StreamState::Left }
       loop do
         select
         when chunk = @chunk_channel.receive?
@@ -191,22 +223,26 @@ class Agent
     end
 
     # Internal: push a chunk (safe to call from any fiber).
-    # Uses a buffered channel with capacity 256.
     #
-    # When nobody is consuming via #stream, chunks are discarded entirely
-    # — the final message is assembled from SSE deltas regardless, so
-    # dropping character-level chunks does not affect correctness.
-    # This prevents deadlocks when the model emits long tool-call
-    # argument strings and the caller uses #message directly.
-    #
-    # When #stream is active, blocks until the consumer reads.
+    # Until #stream is called, chunks queue in memory without blocking, so
+    # a caller that starts streaming late still gets every chunk, and one
+    # that only calls #message never blocks the agent fiber. While #stream
+    # runs, chunks go through the 256-slot channel and the fiber blocks if
+    # the consumer falls behind. After the consumer leaves, they are dropped.
     def push_chunk(chunk : Chunk) : Nil
-      return unless synchronize { @streaming }
-
       if handler = @chunk_handler
         chunk = handler.call(chunk)
       end
-      @chunk_channel.send(chunk)
+
+      queued = synchronize do
+        @chunks_pushed += 1
+        case @stream_state
+        in .waiting?   then @backlog << chunk; true
+        in .left?      then true
+        in .streaming? then false
+        end
+      end
+      @chunk_channel.send(chunk) unless queued
     rescue Channel::ClosedError
       # already finished
     end

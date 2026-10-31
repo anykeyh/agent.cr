@@ -7,7 +7,7 @@ require "http/server"
 
 private alias Script = Array(HTTP::Server::Context -> Nil)
 
-private def with_script(handlers : Script, &)
+private def with_script(handlers : Script, retries = 0, &)
   queue = handlers.dup
   requests = [] of JSON::Any
   server = HTTP::Server.new do |ctx|
@@ -24,6 +24,7 @@ private def with_script(handlers : Script, &)
   agent = Agent.new(Agent::Config.new(
     api_endpoint: "http://127.0.0.1:#{port}/v1",
     idle_byte_timeout: 5, first_byte_timeout_min: 5, first_byte_timeout_max: 5,
+    max_retries: retries, retry_base_delay: 10.milliseconds,
   ))
   begin
     yield agent, requests
@@ -65,6 +66,44 @@ private def status_reply(code : Int32, body : String = "") : HTTP::Server::Conte
     ctx.response.print body
     nil
   }
+end
+
+# Answers each connection with the next raw HTTP bytes, then closes the
+# socket: a way to cut a chunked stream off mid-way.
+private def with_raw_replies(replies : Array(String), retries = 0, &)
+  server = TCPServer.new("127.0.0.1", 0)
+  connections = 0
+  spawn do
+    while client = server.accept?
+      client.gets("\r\n\r\n") # request head
+      reply = replies[connections]? || replies.last
+      connections += 1
+      client.print reply
+      client.flush
+      client.close
+    end
+  end
+  agent = Agent.new(Agent::Config.new(
+    api_endpoint: "http://127.0.0.1:#{server.local_address.port}/v1",
+    idle_byte_timeout: 5, first_byte_timeout_min: 5, first_byte_timeout_max: 5,
+    max_retries: retries, retry_base_delay: 10.milliseconds,
+  ))
+  begin
+    yield agent, -> { connections }
+  ensure
+    agent.close
+    server.close
+  end
+end
+
+# A 200 event stream with these chunks of content, cut off without the
+# terminating chunk.
+private def truncated_stream(contents : Array(String)) : String
+  head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+  head + contents.join do |c|
+    event = "data: #{{choices: [{index: 0, delta: {content: c}}]}.to_json}\n\n"
+    "#{event.bytesize.to_s(16)}\r\n#{event}\r\n"
+  end
 end
 
 # Runs the block in a fiber and fails the spec instead of hanging the suite.
@@ -256,7 +295,8 @@ describe "Agent robustness" do
       chunks = "abc".chars.map { |ch| {choices: [{delta: {content: ch.to_s}, index: 0}]}.to_json }
       ctx.response.content_type = "text/event-stream"
       chunks.each { |c| sleep 100.milliseconds; ctx.response.puts "data: #{c}"; ctx.response.flush }
-      sse(ctx, [] of String)
+      ctx.response.puts "data: [DONE]"
+      ctx.response.close
       nil
     }
     with_script([slow]) do |agent, _|
@@ -265,5 +305,211 @@ describe "Agent robustness" do
       within(2) { resp.message.content }.should eq("abc")
       expect_raises(Agent::ClosedError) { agent.ask("y") }
     end
+  end
+
+  describe "provider errors" do
+    it "retries a 429 or 5xx before the stream starts, honouring Retry-After" do
+      limited = ->(ctx : HTTP::Server::Context) {
+        ctx.response.headers["Retry-After"] = "0.05"
+        status_reply(429, %({"error":{"message":"slow down"}})).call(ctx)
+      }
+      with_script([limited, status_reply(503), text_reply("ok")], retries: 2) do |agent, requests|
+        resp = agent.ask("x")
+        resp.message.content.should eq("ok")
+        requests.size.should eq(3)
+      end
+    end
+
+    it "gives up after max_retries with the last error, its body and headers" do
+      err = ->(ctx : HTTP::Server::Context) {
+        ctx.response.headers["x-request-id"] = "req_123"
+        status_reply(500, %({"error":{"message":"upstream exploded"}})).call(ctx)
+      }
+      with_script([err, err], retries: 1) do |agent, requests|
+        resp = agent.ask("x")
+        resp.join
+        error = resp.error.as(Agent::ApiError)
+        error.status_code.should eq(500)
+        error.message.should eq("500 Internal Server Error: upstream exploded")
+        error.request_id.should eq("req_123")
+        error.body.try(&.includes?("upstream exploded")).should be_true
+        requests.size.should eq(2)
+      end
+    end
+
+    it "does not retry a client error" do
+      with_script([status_reply(400, %({"error":{"message":"bad schema"}})), text_reply("ok")], retries: 2) do |agent, requests|
+        resp = agent.ask("x")
+        resp.join
+        resp.error.as(Agent::ApiError).message.should eq("400 Bad Request: bad schema")
+        requests.size.should eq(1)
+      end
+    end
+
+    it "does not wait out a Retry-After longer than retry_max_delay" do
+      long = ->(ctx : HTTP::Server::Context) {
+        ctx.response.headers["Retry-After"] = "3600"
+        status_reply(429).call(ctx)
+      }
+      with_script([long, text_reply("ok")], retries: 2) do |agent, requests|
+        resp = within(2) { agent.ask("x").tap(&.join) }
+        resp.error.as(Agent::ApiError).retry_after.should eq(3600.seconds)
+        requests.size.should eq(1)
+      end
+    end
+
+    it "fails on an error event inside the stream" do
+      broken = ->(ctx : HTTP::Server::Context) {
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.puts "data: #{{choices: [{index: 0, delta: {content: "Hal"}}]}.to_json}"
+        ctx.response.puts "data: #{{error: {code: 502, message: "Upstream provider error"}, choices: [{index: 0, delta: {content: ""}, finish_reason: "error"}]}.to_json}"
+        ctx.response.puts "data: [DONE]"
+        ctx.response.close
+        nil
+      }
+      with_script([broken, text_reply("never")], retries: 2) do |agent, requests|
+        resp = agent.ask("x")
+        resp.join
+        error = resp.error.as(Agent::StreamError)
+        error.code.should eq("502")
+        resp.message.content.should eq("Agent error: provider error in stream: Upstream provider error")
+        requests.size.should eq(1) # tokens had streamed: not retried
+        agent.history.should be_empty
+      end
+    end
+
+    it "fails on a stream that stops before the model finished" do
+      cut = ->(ctx : HTTP::Server::Context) {
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.puts "data: #{{choices: [{index: 0, delta: {content: "Half an ans"}}]}.to_json}"
+        ctx.response.close
+        nil
+      }
+      with_script([cut]) do |agent, _|
+        resp = agent.ask("x")
+        resp.join
+        resp.error.should be_a(Agent::StreamError)
+        resp.error.try(&.message).should eq("stream ended before the model finished")
+      end
+    end
+  end
+
+  it "skips the remaining tool calls once the response is cancelled" do
+    calls = [{"c1", "first", "{}"}, {"c2", "second", "{}"}]
+    with_script([tool_reply(calls)]) do |agent, _|
+      ran = [] of String
+      current = [] of Agent::Response
+      agent.register_tool("first", "first") { |_| ran << "first"; current.each(&.cancel); "done" }
+      agent.register_tool("second", "second") { |_| ran << "second"; "done" }
+      resp = agent.ask("go")
+      current << resp
+      resp.join
+      ran.should eq(["first"])
+      resp.error.should be_a(Agent::CancelledError)
+      agent.history.last.content.should eq("Error: cancelled before this tool ran")
+    end
+  end
+
+  it "delivers chunks that arrived before #stream was called" do
+    with_script([text_reply("hello")]) do |agent, _|
+      resp = agent.ask("x")
+      resp.join
+      text = String.build { |io| resp.stream { |c| io << c.text } }
+      text.should eq("hello")
+    end
+  end
+
+  describe "where a failure lands" do
+    it "retries an error event that arrives before any output" do
+      first = ->(ctx : HTTP::Server::Context) {
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.puts "data: #{{error: {code: 503, message: "No provider available"}}.to_json}"
+        ctx.response.close
+        nil
+      }
+      with_script([first, text_reply("ok")], retries: 1) do |agent, requests|
+        resp = agent.ask("x")
+        resp.message.content.should eq("ok")
+        requests.size.should eq(2)
+      end
+    end
+
+    it "retries a later call of a tool loop although an earlier one streamed" do
+      calls = [{"c1", "probe", "{}"}]
+      with_script([tool_reply(calls), status_reply(503), text_reply("done")], retries: 1) do |agent, requests|
+        agent.register_tool("probe", "probe") { |_| "ok" }
+        resp = agent.ask("x")
+        resp.message.content.should eq("done")
+        requests.size.should eq(3)
+      end
+    end
+
+    it "does not retry an error event with a client error code" do
+      first = ->(ctx : HTTP::Server::Context) {
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.puts "data: #{{error: {code: 402, message: "Insufficient credits"}}.to_json}"
+        ctx.response.close
+        nil
+      }
+      with_script([first, text_reply("ok")], retries: 2) do |agent, requests|
+        resp = agent.ask("x")
+        resp.join
+        resp.error.as(Agent::StreamError).retryable?.should be_false
+        resp.partial?.should be_false
+        requests.size.should eq(1)
+      end
+    end
+
+    it "reports a connection lost mid-stream as a partial StreamError" do
+      with_raw_replies([truncated_stream(["Hel", "lo"])], retries: 2) do |agent, connections|
+        resp = agent.ask("x")
+        text = String.build { |io| resp.stream { |c| io << c.text } }
+        text.should eq("Hello")
+        error = resp.error.as(Agent::StreamError)
+        error.message.try(&.starts_with?("connection lost during the stream")).should be_true
+        error.cause.should be_a(IO::Error)
+        resp.partial?.should be_true
+        connections.call.should eq(1) # output had streamed: not retried
+        agent.history.should be_empty
+      end
+    end
+
+    it "retries a stream cut off before any output" do
+      with_raw_replies([truncated_stream([] of String), truncated_stream(["ok"])], retries: 1) do |agent, connections|
+        resp = agent.ask("x")
+        resp.join
+        connections.call.should eq(2)
+        resp.partial?.should be_true # the second one was cut off too, after output
+      end
+    end
+
+    it "fails a 200 with a JSON body instead of a stream" do
+      json = ->(ctx : HTTP::Server::Context) {
+        ctx.response.content_type = "application/json"
+        ctx.response.print %({"error":{"message":"model not found"}})
+        nil
+      }
+      with_script([json, text_reply("ok")], retries: 2) do |agent, requests|
+        resp = agent.ask("x")
+        resp.join
+        resp.error.as(Agent::StreamError).message.should eq("provider replied with JSON instead of a stream: model not found")
+        requests.size.should eq(1)
+      end
+    end
+
+    it "passes an Agent::Error raised by a chunk handler through unchanged" do
+      with_script([text_reply("hi")]) do |agent, _|
+        agent.use(Agent::Spec::ChunkRefuser.new)
+        resp = agent.ask("x")
+        resp.join
+        resp.error.should be_a(Agent::Spec::QuotaError)
+      end
+    end
+  end
+end
+
+class Agent::Spec::ChunkRefuser < Agent::Handler
+  def handle(ctx : Agent::ChunkContext, next_proc : Agent::ChunkContext -> Agent::Response::Chunk) : Agent::Response::Chunk
+    raise Agent::Spec::QuotaError.new("out of tokens", "t1")
   end
 end

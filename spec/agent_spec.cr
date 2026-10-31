@@ -233,6 +233,7 @@ describe Agent do
     config = Agent::Config.new(
       api_key: "bad-key",
       api_endpoint: "http://localhost:1",
+      max_retries: 0,
     )
 
     agent = Agent.new(config)

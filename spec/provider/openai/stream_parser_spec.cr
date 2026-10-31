@@ -66,8 +66,6 @@ private def parse_lines(lines : Array(String))
     response.stream { |c| collected.send(c.text) if c.reasoning? }
     collected.close
   end
-  # Let the stream fiber run so `@streaming` is set before the parser pushes
-  # chunks (otherwise `push_chunk` drops them).
   Fiber.yield
 
   io = IO::Memory.new(lines.join('\n'))
@@ -83,6 +81,20 @@ private def parse_lines(lines : Array(String))
 end
 
 describe Agent::Provider::OpenAI::StreamParser do
+  it "ignores a null error field on an ordinary event" do
+    parse_lines([
+      %(data: {"error":null,"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"}]}),
+    ])
+  end
+
+  it "reads an error event's type when it has no code" do
+    error = expect_raises(Agent::StreamError) do
+      parse_lines([%(data: {"error":{"type":"overloaded_error","message":"Overloaded"}})])
+    end
+    error.code.should eq("overloaded_error")
+    error.retryable?.should be_true
+  end
+
   it "reads delta.reasoning_content (DeepSeek native)" do
     chunks, reasoning = parse_lines([
       %(data: {"choices":[{"index":0,"delta":{"reasoning_content":"Hello "}}]}),
@@ -233,6 +245,7 @@ describe Agent::Provider::OpenAI::StreamParser do
       %(data: {"choices":[{"index":0,"delta":{"content":"a"}}]}),
       ": OPENROUTER PROCESSING",
       %(data: {"choices":[{"index":0,"delta":{"content":"b"}}]}),
+      "data: [DONE]",
     ], delays: [25.milliseconds, 25.milliseconds, 25.milliseconds])
 
     response, msg, _usage, _finish = parse_with_timeouts(io,

@@ -603,7 +603,7 @@ class Agent
     end
 
     if max_iter && iteration > max_iter
-      err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
+      err_msg = "tool call iteration limit (#{max_iter}) exceeded"
       response.finish_with_error(ToolLoopError.new(max_iter, err_msg), usage)
       return true
     end
@@ -644,6 +644,13 @@ class Agent
     results = [] of Message
 
     tool_calls.each do |tc|
+      # A cancel stops the remaining calls; each still gets a result so the
+      # history stays valid.
+      if response.cancelled?
+        results << Message.tool_result(tc, "Error: cancelled before this tool ran", is_error: true)
+        next
+      end
+
       entry = @registered_tools.lock { |t| t[tc.name]? }
       if entry.nil? || !entry[:enabled]
         results << Message.new(
@@ -858,16 +865,36 @@ class Agent
     @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
       all_tools = combined_tools(ctx.tools)
       req = @provider.build_request(ctx.messages, all_tools)
+      post_with_retries(req, response, turn_usage)
+    end
+  end
 
-      first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
+  # POST the request and parse its stream. A failure is retried up to
+  # `Config#max_retries` times with backoff, honouring `Retry-After`, when it
+  # is transient and no output has streamed yet; once it has, nothing is
+  # retried. A failure after the provider accepted the request (HTTP 200)
+  # is a StreamError, whatever broke.
+  private def post_with_retries(
+    req : NamedTuple(path: String, headers: HTTP::Headers, body: String),
+    response : Response,
+    turn_usage : Usage,
+  ) : {Message, Usage, String?}
+    first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
+    attempt = 0
+
+    loop do
       client = @http_client
       partial_msg = nil
+      accepted = false
+      chunks_before = response.chunks_pushed
 
       begin
-        client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
-          unless http_resp.status.ok?
-            raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
-          end
+        raise CancelledError.new if response.cancelled?
+
+        return client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
+          raise api_error(http_resp) unless http_resp.status.ok?
+          accepted = true
+          raise json_instead_of_stream(http_resp) if json_body?(http_resp)
 
           msg, usage, finish_reason = @provider.parse_stream(
             http_resp.body_io,
@@ -888,9 +915,106 @@ class Agent
           {msg, usage, finish_reason}
         end
       rescue ex
-        handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout, turn_usage)
+        ex = stream_failure(ex) if accepted
+        # Retry only while this call has shown nothing; an earlier call of
+        # the tool loop may have.
+        output = response.chunks_pushed != chunks_before
+        delay = retry_delay(ex, attempt) unless output || response.cancelled?
+        return handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout, turn_usage) unless delay
+
+        attempt += 1
+        rebuild_http_client
+        wait_unless_cancelled(delay, response)
       end
     end
+  end
+
+  # A failure once the request was accepted, as a StreamError: the socket
+  # dropping (plain or TLS) is transient, anything else (a malformed stream)
+  # is not. Agent errors, and timeouts, keep their own type.
+  private def stream_failure(ex : Exception) : Exception
+    case ex
+    when Agent::Error, IO::TimeoutError
+      ex
+    when IO::Error, OpenSSL::Error
+      StreamError.new("connection lost during the stream: #{ex.message}", cause: ex, retryable: true)
+    else
+      StreamError.new("could not read the stream: #{ex.message || ex.class.name}", cause: ex)
+    end
+  end
+
+  # How long to wait before retrying after `ex`, or nil to give up. A
+  # `Retry-After` longer than `Config#retry_max_delay` is not waited out.
+  private def retry_delay(ex : Exception, attempt : Int32) : Time::Span?
+    return if attempt >= @config.max_retries
+    return unless retryable?(ex)
+
+    if ex.is_a?(ApiError) && (wait = ex.retry_after)
+      return wait <= @config.retry_max_delay ? wait : nil
+    end
+    backoff = @config.retry_base_delay * (2 ** attempt) * Random.rand(0.5..1.0)
+    backoff < @config.retry_max_delay ? backoff : @config.retry_max_delay
+  end
+
+  # Connection errors are transient. Of timeouts, only connecting is: a
+  # provider slow to answer is not retried, since that doubles an already
+  # long wait. Of TLS errors, only a session the peer cut off: a bad
+  # certificate fails the same way again.
+  private def retryable?(ex : Exception) : Bool
+    case ex
+    when ApiError, StreamError then ex.retryable?
+    when IO::TimeoutError      then ex.message.try(&.downcase.starts_with?("connect timed out")) || false
+    when IO::Error             then true
+    when OpenSSL::SSL::Error   then ex.underlying_eof?
+    else                            false
+    end
+  end
+
+  private def wait_unless_cancelled(delay : Time::Span, response : Response) : Nil
+    deadline = Time.instant + delay
+    while !response.cancelled? && (left = deadline - Time.instant) > Time::Span.zero
+      sleep(left < 50.milliseconds ? left : 50.milliseconds)
+    end
+  end
+
+  # An ApiError for a non-2xx response, with the start of its body, its
+  # headers, and the provider's error message when the body has one.
+  private def api_error(http_resp : HTTP::Client::Response) : ApiError
+    body = IO::Memory.new
+    if io = http_resp.body_io?
+      begin
+        IO.copy(io, body, ApiError::BODY_LIMIT)
+      rescue IO::Error
+        # keep what was read
+      end
+    end
+    text = body.to_s
+
+    message = "#{http_resp.status_code} #{http_resp.status_message}"
+    if detail = provider_error_message(text)
+      message += ": #{detail}"
+    end
+    ApiError.new(http_resp.status_code, message, body: text.presence, headers: http_resp.headers)
+  end
+
+  # Some gateways answer a streaming request with a 200 and a JSON error
+  # body instead of an event stream.
+  private def json_body?(http_resp : HTTP::Client::Response) : Bool
+    http_resp.headers["Content-Type"]?.try(&.downcase.starts_with?("application/json")) || false
+  end
+
+  private def json_instead_of_stream(http_resp : HTTP::Client::Response) : StreamError
+    text = String.build { |io| http_resp.body_io?.try { |b| IO.copy(b, io, ApiError::BODY_LIMIT) } }
+    detail = provider_error_message(text) || "no event stream"
+    StreamError.new("provider replied with JSON instead of a stream: #{detail}")
+  end
+
+  # `error.message` from an OpenAI-style JSON error body.
+  private def provider_error_message(text : String) : String?
+    error = JSON.parse(text).as_h?.try(&.["error"]?) || return
+    error.as_s? || error.as_h?.try(&.["message"]?).try(&.as_s?)
+  rescue JSON::ParseException
+    nil
   end
 
   # Centralised error handler for #http_post_stream. Dispatches on the
@@ -919,10 +1043,6 @@ class Agent
     end
 
     case ex
-    when ApiError
-      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-      response.finish_with_error(err, turn_usage)
-      error_tuple(err)
     when CancelledError, IdleTimeoutError
       err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
       response.finish_with_error(err, turn_usage)
@@ -938,6 +1058,11 @@ class Agent
       end
       response.finish_with_error(err, turn_usage)
       error_tuple(err, partial_msg)
+    when Agent::Error
+      # ApiError, StreamError, or one a handler raised: passed through.
+      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
+      response.finish_with_error(err, turn_usage)
+      error_tuple(err)
     else
       err = @handlers.decorate(ErrorContext.new(ex)) do |c|
         ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)

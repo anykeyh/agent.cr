@@ -516,6 +516,10 @@ Agent::Config.new(
   first_byte_timeout_ms_per_token:  Int32 = 3,                # ms added per estimated input token (~4 chars/token)
   idle_byte_timeout:                Time::Span | Int32 = 60,  # gap allowed between any two consecutive SSE lines
   compute_first_byte_timeout:       Bool = true,              # false → dynamic first-byte disabled, both phases use idle_byte_timeout
+  # Retries of a model call that fails transiently before streaming any output:
+  max_retries:                      Int32 = 2,                # 0 turns retrying off
+  retry_base_delay:                 Time::Span | Int32 = 1,   # first backoff; doubles per retry, with jitter
+  retry_max_delay:                  Time::Span | Int32 = 30,  # longest wait; a longer Retry-After isn't retried
 )
 ```
 
@@ -561,17 +565,25 @@ resp.join
 if resp.error?
   puts "Request failed: #{resp.error.message}"
   puts resp.error.class  # Agent::ConnectionError, Agent::ApiError, etc.
+  puts "(the text shown above is incomplete)" if resp.partial?
 else
   puts resp.message.content
 end
 ```
 
+Where a failure lands decides its type and whether it is retried:
+
+- Before the provider answers: `ConnectionError`, or `ApiError` for a non-2xx status.
+- After a 200: `StreamError` (or `IdleTimeoutError` for a stall).
+- A transient failure is retried (`max_retries`) only while the call has streamed nothing. After that, `resp.partial?` is true and the caller decides whether to ask again.
+
 Error types:
 
 | Error | When |
 |---|---|
-| `Agent::ApiError` | API returned a non-2xx status code (includes `.status_code`) |
-| `Agent::ConnectionError` | Network / connection failure |
+| `Agent::ApiError` | API returned a non-2xx status code, after any retries. Has `.status_code`, `.body` (start of the response body), `.headers`, `.request_id` and `.retry_after`; `.message` includes the provider's error message |
+| `Agent::StreamError` | The provider accepted the request (HTTP 200) but the stream failed: an error event (`.code` holds its code), a dropped connection, a stream that ended before the model finished, or one that couldn't be read. `.cause` holds the original exception |
+| `Agent::ConnectionError` | Network / connection failure before the provider answered |
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
 | `Agent::IdleTimeoutError` | Provider stream stuck — no bytes within the first-byte or idle per-read timeout (`phase = :first_byte` or `:idle`, `timeout = Time::Span`) |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |

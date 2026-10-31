@@ -370,7 +370,12 @@ flowchart TD
   caller skipped the follow-up, or a turn failed midway) gets an error
   result, so history is always a valid request.
 - If `http_post_stream` fails, the response finishes with the error and the
-  turn's usage so far, and the loop exits (no retry). A failed first call
+  turn's usage so far, and the loop exits. A transient failure (connection
+  error, 408/409/429/5xx, a stream error event with such a code, a cut-off
+  stream) is first retried up to `max_retries` times with backoff and
+  `Retry-After`, but only while that model call has pushed no chunk; after
+  that, `Response#partial?` tells the caller the shown text is incomplete.
+  Anything that fails after the 200 is a `StreamError`. A failed first call
   rolls the turn back; a later failure keeps it, since tools have run.
 - Any other exception escaping the loop (a handler, the provider) finishes
   the response with it instead of killing the fiber. A `Handler` can
