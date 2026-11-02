@@ -79,6 +79,22 @@ def with_mock_server(&)
   end
 end
 
+# Records every ToolCallContext dispatched through the handler chain.
+# Used to prove that tool-argument parse/validation failures reach handlers
+# like normal tool executions (see the handler-chain specs below).
+class Agent::Spec::ToolCallRecorder < Agent::Handler
+  getter calls : Array(Agent::ToolCallContext)
+
+  def initialize
+    @calls = [] of Agent::ToolCallContext
+  end
+
+  def handle(ctx : Agent::ToolCallContext, next_proc) : Agent::Message
+    @calls << ctx
+    next_proc.call(ctx)
+  end
+end
+
 describe Agent do
   it "asks a question and gets a streamed response" do
     with_mock_server do |port|
@@ -889,6 +905,192 @@ describe Agent do
       callback_called.should be_true
       resp.message.content.should eq("Stored")
       received_payload.try(&.raw).should be_nil
+    ensure
+      server.close
+    end
+  end
+
+  it "runs the handler chain when tool arguments fail schema validation" do
+    # 1st request -> tool call missing the required 'city' field
+    # 2nd request -> plain answer after the validation error fed back
+    # Regression guard: the validation failure must dispatch a ToolCallContext
+    # through the handler chain like a normal tool run. If the error message is
+    # built directly instead, handlers (e.g. a tool-trace) never observe the
+    # call and the failure becomes invisible downstream.
+    call_count = 0
+    request_bodies = [] of String
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        request_bodies << (ctx.request.body.try(&.gets_to_end) || "{}")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "get_weather", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"location":"Paris"})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Recovered"
+          final = {"choices" => [{"delta" => {"content" => reply}, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+      recorder = Agent::Spec::ToolCallRecorder.new
+      agent.use(recorder)
+
+      callback_called = false
+      agent.register_tool("get_weather", "Get the weather",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            city: {type: "string"},
+          },
+          required: ["city"],
+        })
+      ) do |_args|
+        callback_called = true
+        "sunny"
+      end
+
+      resp = agent.ask("What's the weather?")
+      resp.join
+
+      # The handler chain observed exactly one tool call — the failed one.
+      recorder.calls.size.should eq(1)
+      recorder.calls[0].tool_call.name.should eq("get_weather")
+      recorder.calls[0].tool_call.id.should eq("call_001")
+
+      # The callback was skipped, and the error reached the model as the tool
+      # result so it can self-correct instead of looping.
+      callback_called.should be_false
+      resp.message.content.should eq("Recovered")
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[2].content.should eq(
+        "Error validating arguments for tool 'get_weather': Missing required field 'city'"
+      )
+      request_bodies[1].should contain("Missing required field 'city'")
+    ensure
+      server.close
+    end
+  end
+
+  it "runs the handler chain when tool arguments are invalid JSON" do
+    # 1st request -> tool call whose arguments are truncated JSON
+    # 2nd request -> plain answer after the parse error fed back
+    call_count = 0
+    request_bodies = [] of String
+    server = HTTP::Server.new do |ctx|
+      if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
+        request_bodies << (ctx.request.body.try(&.gets_to_end) || "{}")
+        call_count += 1
+        ctx.response.content_type = "text/event-stream"
+        ctx.response.status_code = 200
+
+        if call_count == 1
+          delta1 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "id" => "call_001", "type" => "function", "function" => {"name" => "get_weather", "arguments" => ""}}]}, "index" => 0}]}.to_json
+          delta2 = {"choices" => [{"delta" => {"tool_calls" => [{"index" => 0, "function" => {"arguments" => %({"city": "Paris})}}]}, "index" => 0}]}.to_json
+          final = {"choices" => [{"delta" => {} of String => JSON::Any, "index" => 0, "finish_reason" => "tool_calls"}], "usage" => {"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}}.to_json
+          ctx.response.puts "data: #{delta1}"
+          ctx.response.flush
+          ctx.response.puts "data: #{delta2}"
+          ctx.response.flush
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        else
+          reply = "Recovered"
+          final = {"choices" => [{"delta" => {"content" => reply}, "index" => 0, "finish_reason" => "stop"}], "usage" => {"prompt_tokens" => 20, "completion_tokens" => reply.size, "total_tokens" => 20 + reply.size}}.to_json
+          ctx.response.puts "data: #{final}"
+          ctx.response.puts "data: [DONE]"
+          ctx.response.flush
+        end
+        ctx.response.close
+      else
+        ctx.response.status_code = 404
+        ctx.response.puts "Not Found"
+      end
+    end
+
+    address = server.bind_tcp(0)
+    port = address.port
+    ready = Channel(Nil).new
+    spawn do
+      ready.send(nil)
+      server.listen
+    end
+    ready.receive
+
+    begin
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        auto_execute_tools: true,
+      )
+
+      agent = Agent.new(config)
+      recorder = Agent::Spec::ToolCallRecorder.new
+      agent.use(recorder)
+
+      callback_called = false
+      agent.register_tool("get_weather", "Get the weather",
+        parameters: Agent::JSONConverter.from({
+          type:       "object",
+          properties: {
+            city: {type: "string"},
+          },
+          required: ["city"],
+        })
+      ) do |_args|
+        callback_called = true
+        "sunny"
+      end
+
+      resp = agent.ask("What's the weather?")
+      resp.join
+
+      recorder.calls.size.should eq(1)
+      recorder.calls[0].tool_call.name.should eq("get_weather")
+
+      callback_called.should be_false
+      resp.message.content.should eq("Recovered")
+      agent.history[2].role.should eq(Agent::Role::Tool)
+      agent.history[2].content.should eq(
+        "Error parsing arguments for tool 'get_weather': invalid JSON"
+      )
+      request_bodies[1].should contain("invalid JSON")
     ensure
       server.close
     end

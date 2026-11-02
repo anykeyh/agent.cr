@@ -308,7 +308,7 @@ Four context types correspond to the four pipeline stages. A `Handler` subclass 
 |---|---|---|
 | `TurnContext` | Before the HTTP request is built | Mutate `ctx.messages` and `ctx.tools` before they're sent to the model |
 | `ChunkContext` | Each streamed SSE delta | Replace `ctx.chunk` to rewrite tokens in-flight |
-| `ToolCallContext` | Before a tool callback is executed | Approve/deny tool execution, cancel the response |
+| `ToolCallContext` | Around each tool call — argument parse and validation failures included | Approve/deny tool execution, cancel the response |
 | `ErrorContext` | After an exception escapes the pipeline | Wrap or replace the error before it's recorded |
 
 ### Writing a handler

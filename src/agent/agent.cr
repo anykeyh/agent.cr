@@ -613,12 +613,15 @@ class Agent
         parsed = JSON.parse(tc.arguments)
         parsed.as_h? || {} of String => JSON::Any
       rescue JSON::ParseException
-        results << Message.new(
+        error_msg = Message.new(
           role: Role::Tool,
           content: "Error parsing arguments for tool '#{tc.name}': invalid JSON",
           tool_call_id: tc.id,
           name: tc.name,
         )
+        # Run the failure through the handler chain like a normal tool run,
+        # so handlers can trace it. The chain leaf returns the error message.
+        results << @handlers.decorate(ToolCallContext.new(tc, response)) { |_ctx| error_msg }
         next
       end
 
@@ -626,12 +629,15 @@ class Agent
       if params_schema = entry[:tool].function.parameters
         errors = validate_tool_args(tc.name, args_hash, params_schema)
         unless errors.empty?
-          results << Message.new(
+          error_msg = Message.new(
             role: Role::Tool,
             content: "Error validating arguments for tool '#{tc.name}': #{errors.join("; ")}",
             tool_call_id: tc.id,
             name: tc.name,
           )
+          # Run the failure through the handler chain like a normal tool run,
+          # so handlers can trace it. The chain leaf returns the error message.
+          results << @handlers.decorate(ToolCallContext.new(tc, response)) { |_ctx| error_msg }
           next
         end
       end

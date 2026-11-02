@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Tool-argument failures now run through the handler chain like normal tool
+  executions: calls whose arguments are invalid JSON or fail parameter-schema
+  validation dispatch a `ToolCallContext` to registered handlers (the chain
+  leaf returns the pre-built error message). Previously these two paths built
+  the error message directly, bypassing `ChainHandler#decorate`, so
+  handler-based tracing never observed the failed call.
+
 ## [0.2.0] - 2026-10-19
 
 ### Fixed
